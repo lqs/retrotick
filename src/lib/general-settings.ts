@@ -3,6 +3,8 @@
 export interface GeneralSettings {
   /** Semicolon-separated search path for executables and DLLs. */
   path: string;
+  /** Use the v86 JIT backend for PE32 executables (experimental). */
+  v86Backend: boolean;
 }
 
 const STORAGE_KEY = 'retrotick-general';
@@ -13,6 +15,7 @@ export const DEFAULT_PATH =
 
 const DEFAULTS: GeneralSettings = {
   path: DEFAULT_PATH,
+  v86Backend: false,
 };
 
 export function loadGeneralSettings(): GeneralSettings {

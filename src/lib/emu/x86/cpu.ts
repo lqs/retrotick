@@ -4,6 +4,7 @@ import { decodeModRM as _decodeModRM, decodeSIB as _decodeSIB, getSegOverrideSel
 import { cpuStep } from './dispatch';
 import { LazyOp } from './lazy-op';
 import type { Emulator } from '../emulator';
+import type { ICpu } from '../backend';
 
 // Register indices
 const EAX = 0, ECX = 1, EDX = 2, EBX = 3, ESP = 4, EBP = 5, ESI = 6, EDI = 7;
@@ -17,7 +18,7 @@ const TF = 0x100;
 const DF = 0x400;
 const OF = 0x800;
 
-export class CPU {
+export class CPU implements ICpu {
   mem: Memory;
   reg = new Int32Array(8);
   eip = 0;

@@ -585,6 +585,30 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
       emu.dosSpeedFactor = dsPre.speed;
       emu.traceApi = dsPre.traceApi;
 
+      // Optional v86 JIT backend for PE32. Only applies to 32-bit Windows PE
+      // (machine=0x014C, not MZ/COM/NE). Other formats fall through to the
+      // own-backend path.
+      const gs = (await import('../lib/general-settings')).loadGeneralSettings();
+      const isPE32 =
+        !peInfo.isCOM && !peInfo.isMZ && !peInfo.isNE &&
+        peInfo.coffHeader?.machine === 0x014C;
+      if (gs.v86Backend && isPE32) {
+        const { attachV86PEToEmulator } = await import('../lib/emu/v86/bootstrap');
+        emu.canvas = canvas;
+        emu.canvasCtx = canvas.getContext('2d');
+        emu.isConsole = !!peInfo.optionalHeader && peInfo.optionalHeader.subsystem === 3;
+        if (emu.isConsole) emu.initConsoleBuffer();
+        if (commandLine) emu.commandLine = commandLine;
+        emu.exeName = exeName;
+        // Sibling files (DLLs, data) must be on emu.additionalFiles BEFORE
+        // attach, because the DLL pre-loader reads from it during PE walk.
+        if (additionalFiles) {
+          for (const [name, data] of additionalFiles) emu.additionalFiles.set(name, data);
+        }
+        await attachV86PEToEmulator(emu, arrayBuffer, peInfo, { wasmUrl: '/v86.wasm' });
+        return;
+      }
+
       await emu.load(arrayBuffer, peInfo, canvas);
     };
 

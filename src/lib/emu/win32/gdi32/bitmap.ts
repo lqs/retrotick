@@ -461,6 +461,15 @@ export function registerBitmap(emu: Emulator): void {
       }
     };
 
+    // v86 backend has its own scheduler driving frame pacing; the rAF-defer
+    // dance here would mis-resume an unrelated parked thunk (its deferred
+    // emuCompleteThunk targets whatever is parked at fire time). Just blit
+    // synchronously and return.
+    if (emu._v86Runtime) {
+      blitSwap();
+      return 1;
+    }
+
     // If glFinish already yielded in this frame, don't block again at SwapBuffers.
     if (emu.glSyncYieldedThisFrame) {
       blitSwap();

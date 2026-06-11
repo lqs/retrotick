@@ -1,3 +1,5 @@
+import type { IMemory } from './backend';
+
 // ANSI code page encoding name for TextDecoder
 let _ansiEncoding = 'windows-1252';
 let _ansiDecoder: TextDecoder | null = null;
@@ -186,7 +188,7 @@ const SEG_BITS = 16;
 const SEG_SIZE = 1 << SEG_BITS; // 65536
 const SEG_MASK = SEG_SIZE - 1;
 
-export class Memory {
+export class Memory implements IMemory {
   private segments = new Map<number, Uint8Array>();
   private dataViews = new Map<number, DataView>();
 

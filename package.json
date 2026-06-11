@@ -12,7 +12,8 @@
 	"dependencies": {
 		"clsx": "^2.1.1",
 		"fflate": "^0.8.2",
-		"preact": "^10.29.1"
+		"preact": "^10.29.1",
+		"v86": "^0.5.359"
 	},
 	"devDependencies": {
 		"@preact/preset-vite": "^2.10.5",

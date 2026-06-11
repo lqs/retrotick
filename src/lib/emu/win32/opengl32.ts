@@ -807,6 +807,14 @@ export function registerOpengl32(emu: Emulator): void {
       emu.glSyncYieldedThisFrame = false;
       emu.glSyncAwaitingSwap = false;
     }
+    // v86 backend: blit synchronously, don't rAF-defer (would mis-resume an
+    // unrelated parked thunk). v86's scheduler handles frame pacing.
+    if (emu._v86Runtime) {
+      getGL(emu)?.finish();
+      blitGL();
+      return 0;
+    }
+
     // If this frame already yielded (e.g. at SwapBuffers), don't block again.
     if (emu.glSyncYieldedThisFrame) {
       getGL(emu)?.finish();

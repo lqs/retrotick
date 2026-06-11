@@ -114,6 +114,20 @@ export function GeneralSettingsWindow({ onClose, onFocus, onMinimize, zIndex, fo
 
           <div style={{ borderTop: '1px solid #808080', borderBottom: '1px solid #FFF', margin: '0 0 8px', flexShrink: 0 }} />
 
+          {/* v86 backend */}
+          <div style={{ font: FONT, marginBottom: '8px', flexShrink: 0 }}>
+            <label style={{ display: 'flex', alignItems: 'center', gap: '6px', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={settings.v86Backend}
+                onInput={(e) => setSettings({ ...settings, v86Backend: (e.target as HTMLInputElement).checked })}
+              />
+              Use v86 JIT backend for PE32 (experimental)
+            </label>
+          </div>
+
+          <div style={{ borderTop: '1px solid #808080', borderBottom: '1px solid #FFF', margin: '0 0 8px', flexShrink: 0 }} />
+
           {/* Buttons */}
           <div style={{ display: 'flex', justifyContent: 'flex-end', gap: '6px', flexShrink: 0 }}>
             <div style={{ width: '75px', height: '23px' }} onClick={handleReset}>

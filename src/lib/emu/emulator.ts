@@ -286,8 +286,17 @@ export class Win16Module {
   }
 }
 
+export interface EmulatorBackendOverrides {
+  /** Adapter that structurally satisfies the IMemory subset of Memory.
+   *  Cast through `unknown` because v86's adapter doesn't include the
+   *  own-backend-only internals (a20Mask, _ivtProtect, etc). Those internals
+   *  are only accessed by DOS/ARM/own-x86 code paths that never run on v86. */
+  memory: Memory;
+  cpu: CPU;
+}
+
 export class Emulator {
-  memory = new Memory();
+  memory: Memory;
   cpu: CPU;
   handles = new HandleTable();
   canvas: HTMLCanvasElement | null = null;
@@ -305,6 +314,11 @@ export class Emulator {
   pe!: LoadedPE;
   peInfo!: PEInfo;
   arrayBuffer!: ArrayBuffer;
+
+  /** Set when the v86 JIT backend is active. Null when running on the
+   *  built-in own CPU. UI code checks this to choose the run loop. */
+  _v86Runtime: unknown = null;
+  _v86Loaded: unknown = null;
 
   // Console (CUI) mode
   isConsole = false;
@@ -962,8 +976,9 @@ export class Emulator {
     mb.onDismiss(result);
   }
 
-  constructor() {
-    this.cpu = new CPU(this.memory);
+  constructor(backend?: EmulatorBackendOverrides) {
+    this.memory = backend?.memory ?? new Memory();
+    this.cpu = backend?.cpu ?? new CPU(this.memory);
     // Pre-allocate a default IDC_ARROW cursor so currentCursor is never 0
     this.currentCursor = this.handles.alloc('cursor', { css: 'default' });
   }
@@ -1098,7 +1113,9 @@ export class Emulator {
     const aligned = (size + 7) & ~7;
     const addr = this.heapPtr;
     this.heapPtr += aligned;
-    for (let i = 0; i < aligned; i++) this.memory.writeU8(addr + i, 0);
+    // Bulk zero-fill instead of per-byte writeU8 (which is O(aligned) JS calls
+    // and unbearably slow for multi-MB allocs under the v86 backend).
+    this.memory.copyFrom(addr, new Uint8Array(aligned));
     this.heapAllocSizes.set(addr, size);
     // NE mode: register selectors so x86 code can use linear addr as far pointer (DX:AX)
     if (this.isNE) {
@@ -1151,7 +1168,9 @@ export class Emulator {
       addr = this.virtualPtr;
       this.virtualPtr = (this.virtualPtr + alignedSize + 0xFFF) & ~0xFFF;
     }
-    for (let i = 0; i < alignedSize; i++) this.memory.writeU8(addr + i, 0);
+    // Bulk zero-fill (per-byte writeU8 was unbearably slow under v86 backend
+    // for multi-MB VirtualAlloc reservations).
+    this.memory.copyFrom(addr, new Uint8Array(alignedSize));
     this.heapAllocSizes.set(addr, alignedSize);
     return addr >>> 0;
   }
@@ -2014,6 +2033,15 @@ export class Emulator {
     this.halted = false;
     this._crashFired = false;
     this.haltReason = '';
+    if (this._v86Runtime) {
+      // v86 drives its own run loop; just kick it off.
+      (this._v86Runtime as { run: () => Promise<void> }).run().catch(e => {
+        console.error('[v86] run threw:', e);
+        this.halted = true;
+        this.haltReason = String(e);
+      });
+      return;
+    }
     this.tick();
   }
 
@@ -2027,6 +2055,12 @@ export class Emulator {
   }
 
   tick = (): void => {
+    if (this._v86Runtime) {
+      // v86 backend drives its own loop via main_loop. Spurious tick()
+      // calls (from async resume points scheduled before v86 took over)
+      // are no-ops.
+      return;
+    }
     if (this.isARM) {
       emuTickARM(this);
     } else {

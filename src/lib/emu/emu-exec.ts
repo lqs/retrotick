@@ -107,6 +107,16 @@ function scheduleImmediate(fn: () => void): void {
 
 export function emuCompleteThunk(emu: Emulator, retVal: number, stackBytes: number): void {
   emu.cpu.reg[0] = retVal | 0; // EAX
+  if (emu._v86Runtime) {
+    // Under v86, the thunk's own `RET imm16` (when the parked CPU resumes)
+    // pops the caller's retAddr and the stdcall args. We only set EAX here
+    // and let resumeParked() unpark the CPU so the thunk's RET can execute.
+    const rt = emu._v86Runtime as {
+      resumeParkedThunk: () => void;
+    };
+    rt.resumeParkedThunk();
+    return;
+  }
   const retAddr = emu.memory.readU32(emu.cpu.reg[4] >>> 0);
   emu.cpu.reg[4] = (emu.cpu.reg[4] + 4 + stackBytes) | 0; // pop retAddr + args (stdcall)
   emu.cpu.eip = retAddr;
@@ -160,6 +170,48 @@ export function emuResume(emu: Emulator): void {
 
 /** Call a stdcall callback with N args. Used by callWndProc (4 args) and multimedia timers (5 args). */
 function callStdcall(emu: Emulator, addr: number, args: number[]): number | undefined {
+  if (!addr) return 0;
+  // v86 backend: run the callback synchronously by re-entering v86's wasm
+  // main_loop from this trap handler. We push args + a fake return EIP that
+  // points at a trampoline (OUT 0xE9 ; JMP $) inside v86 RAM; when the callee
+  // RETs, the OUT trips a flag and the spin loop lets main_loop bleed out so
+  // it returns to us. Then we restore EIP to where the dispatcher would have
+  // continued naturally, and propagate the callee's EAX up.
+  if (emu._v86Runtime) {
+    const rt = emu._v86Runtime as {
+      nestedRunUntilReturn: (n?: number) => void;
+      cbReturnVA: number;
+    };
+    const cpu = emu.cpu;
+    const savedEIP = cpu.eip;
+    const savedESP = cpu.reg[4];
+    const savedEBX = cpu.reg[3];
+    const savedESI = cpu.reg[6];
+    const savedEDI = cpu.reg[7];
+    const savedEBP = cpu.reg[5];
+    // Mirror own-backend behaviour: track callback nesting so handlers like
+    // PeekMessage / WaitMessage that special-case wndProcDepth>1 (return
+    // synchronously instead of parking on rAF) work under v86 too.
+    emu.wndProcDepth++;
+    // Push args right-to-left, then push the cb-return trampoline as the
+    // callee's return address. Stdcall callee will RET imm16 to pop them.
+    for (let i = args.length - 1; i >= 0; i--) cpu.push32(args[i]);
+    cpu.push32(rt.cbReturnVA);
+    cpu.eip = addr;
+    rt.nestedRunUntilReturn();
+    const retVal = cpu.reg[0] >>> 0;
+    // Restore EIP/ESP and callee-saved regs. ESP restore is critical when
+    // the callee was force-exited by the iteration cap (didn't actually
+    // RET); without it the outer thunk would resume on a dirty stack.
+    cpu.eip = savedEIP;
+    cpu.reg[4] = savedESP;
+    cpu.reg[3] = savedEBX;
+    cpu.reg[5] = savedEBP;
+    cpu.reg[6] = savedESI;
+    cpu.reg[7] = savedEDI;
+    emu.wndProcDepth--;
+    return retVal;
+  }
   if (!addr) return 0;
   if (!emu.isNE && emu.pe) {
     const isThunk = emu.thunkToApi.has(addr);

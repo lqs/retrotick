@@ -299,27 +299,35 @@ export function parsePE(arrayBuffer: ArrayBuffer): PEInfo {
     });
   }
 
+  // UPX detection: section names UPX0/UPX1/UPX2 (and friends from upx variants
+   // like .UPX0). UPX produces 2-3 sections: a zero-raw-size "decompressed
+   // destination" (UPX0), a raw-data section with the compressed payload + stub
+   // (UPX1), and optionally .rsrc with a bare directory.
+  const isUpxPacked = sections.some(s => /^[\.\$]?UPX[0-9]/i.test(s.name));
+
   let resources = null;
   if (dataDirectories.length > 2 && dataDirectories[2].virtualAddress !== 0) {
     const rsrcRva = dataDirectories[2].virtualAddress;
     const rsrcBaseOffset = rvaToFileOffset(rsrcRva, sections);
-    const rootEntries = parseResourceDirectory(dv, rsrcBaseOffset, 0, 0, sections);
+    if (rsrcBaseOffset >= 0) {
+      const rootEntries = parseResourceDirectory(dv, rsrcBaseOffset, 0, 0, sections);
 
-    resources = rootEntries.map(typeEntry => ({
-      typeId: typeEntry.id,
-      typeName: typeEntry.name,
-      typeLabel: typeEntry.id != null ? (RT_TYPES[typeEntry.id] || `Type ${typeEntry.id}`) : typeEntry.name!,
-      entries: (typeEntry.children || []).map(nameEntry => ({
-        id: nameEntry.id,
-        name: nameEntry.name,
-        languages: (nameEntry.children || []).map(langEntry => ({
-          languageId: langEntry.id!,
-          dataRva: langEntry.dataRva!,
-          dataSize: langEntry.dataSize!,
-          codePage: langEntry.codePage!,
+      resources = rootEntries.map(typeEntry => ({
+        typeId: typeEntry.id,
+        typeName: typeEntry.name,
+        typeLabel: typeEntry.id != null ? (RT_TYPES[typeEntry.id] || `Type ${typeEntry.id}`) : typeEntry.name!,
+        entries: (typeEntry.children || []).map(nameEntry => ({
+          id: nameEntry.id,
+          name: nameEntry.name,
+          languages: (nameEntry.children || []).map(langEntry => ({
+            languageId: langEntry.id!,
+            dataRva: langEntry.dataRva!,
+            dataSize: langEntry.dataSize!,
+            codePage: langEntry.codePage!,
+          })),
         })),
-      })),
-    }));
+      }));
+    }
   }
 
   return {
@@ -328,5 +336,6 @@ export function parsePE(arrayBuffer: ArrayBuffer): PEInfo {
     optionalHeader: { magic, isPE32Plus, subsystem, dataDirectories },
     sections,
     resources,
+    isUpxPacked: isUpxPacked || undefined,
   };
 }

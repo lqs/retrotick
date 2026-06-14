@@ -16,6 +16,7 @@ import { registerShell32 } from './win32/shell32';
 import { registerOleaut32 } from './win32/oleaut32';
 import { registerComdlg32 } from './win32/comdlg32';
 import { registerOle32 } from './win32/ole32';
+import { registerOledlg } from './win32/oledlg';
 import { registerMsacm32 } from './win32/msacm32';
 import { registerVersion } from './win32/version';
 import { registerWinspool } from './win32/winspool';
@@ -46,6 +47,7 @@ import { setupBiosRom } from './dos/bios-rom';
 import { VGA_FONT_8X8_ROM, ROM_FONT_8X8_ADDR, ROM_FONT_8X8_SEG, ROM_FONT_8X8_OFF, ROM_FONT_CGA_ADDR } from './dos/vga-font-data';
 import { VGA_FONT_8X16_ROM, ROM_FONT_8X16_ADDR, ROM_FONT_8X16_SEG, ROM_FONT_8X16_OFF } from './dos/vga-font-16';
 import { buildThunkTable, preloadStrings, verifyIAT, initTEB, initThreadTEB } from './emu-thunks-pe';
+import { unpackUpxInPlace } from './upx-runtime';
 import { Thread } from './thread';
 import { parsePE, extractExports, extractMenus } from '../pe';
 
@@ -508,6 +510,7 @@ export async function emuLoad(emu: Emulator, arrayBuffer: ArrayBuffer, peInfo: P
   registerOleaut32(emu);
   registerComdlg32(emu);
   registerOle32(emu);
+  registerOledlg(emu);
   registerMsacm32(emu);
   registerVersion(emu);
   registerWinspool(emu);
@@ -741,6 +744,26 @@ export async function emuLoad(emu: Emulator, arrayBuffer: ArrayBuffer, peInfo: P
 
   // Build thunk page set for fast EIP lookup in hot loop
   rebuildThunkPages(emu);
+
+  // UPX-packed PE: run the embedded decompression stub, then snapshot the
+  // now-populated image so resource/string extraction sees real data.
+  if (peInfo.isUpxPacked) {
+    console.log('[UPX] Detected UPX-packed PE — running decompression stub at entry point');
+    const result = unpackUpxInPlace(emu, peInfo, arrayBuffer);
+    if (result) {
+      arrayBuffer = result.unpackedBuffer;
+      // Adopt the unpacked view: the snapshot's section headers have
+      // PointerToRawData == VirtualAddress, so rvaToFileOffset returns the RVA
+      // directly and resource extraction can read the real (decompressed)
+      // payload. The original `emu.pe.sections` is left alone — it tracks
+      // memory mapping, which hasn't changed.
+      peInfo.resources = result.unpackedInfo.resources;
+      peInfo.sections = result.unpackedInfo.sections;
+      emu.arrayBuffer = arrayBuffer;
+      emu.peInfo = peInfo;
+      console.log(`[UPX] Recovered ${peInfo.resources?.length ?? 0} resource types from unpacked image`);
+    }
+  }
 
   // Pre-extract string resources
   preloadStrings(emu);

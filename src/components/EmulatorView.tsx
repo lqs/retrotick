@@ -4,7 +4,7 @@ import { parsePE, parseCOM, extractMenus, extractIcons } from '../lib/pe';
 import { Emulator } from '../lib/emu/emulator';
 import type { DialogInfo, ControlOverlay, ProcessRegistry, CommonDialogRequest } from '../lib/emu/emulator';
 import type { WindowInfo } from '../lib/emu/win32/user32/index';
-import { WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_MOUSEMOVE, WM_LBUTTONDBLCLK, WM_RBUTTONDBLCLK, WM_COMMAND, WM_SYSCOMMAND, WM_SIZE, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_CHAR, WM_INITMENU, WM_INITMENUPOPUP, MK_LBUTTON, MK_RBUTTON, SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE, SC_CLOSE } from '../lib/emu/win32/types';
+import { WM_LBUTTONDOWN, WM_LBUTTONUP, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_MOUSEMOVE, WM_LBUTTONDBLCLK, WM_RBUTTONDBLCLK, WM_COMMAND, WM_SYSCOMMAND, WM_SIZE, WM_GETMINMAXINFO, WM_KEYDOWN, WM_KEYUP, WM_CHAR, WM_INITMENU, WM_INITMENUPOPUP, WM_MOUSEACTIVATE, MK_LBUTTON, MK_RBUTTON, HTCLIENT, SC_MINIMIZE, SC_MAXIMIZE, SC_RESTORE, SC_CLOSE } from '../lib/emu/win32/types';
 import { MessageBox, MsgBoxIcon, MB_ICONERROR } from './win2k/MessageBox';
 import { MenuBar } from './win2k/MenuBar';
 import { Window, WS_DLGFRAME, WS_CAPTION, WS_SYSMENU, WS_THICKFRAME, WS_MINIMIZEBOX, WS_MAXIMIZEBOX, getBorderWidth } from './win2k/Window';
@@ -382,6 +382,9 @@ function renderMdiChildOverlay(
 export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, commandLine, onStop, onFocus, onReady, onRunExe, onOpenHelp, onSetupEmulator, audioContext: sharedAudioContext, onTitleChange, onIconChange, onMinimize, onRegisterCloseHandler, processRegistry, zIndex = 100, focused = true, minimized: minimizedProp }: EmulatorViewProps) {
   const exeBaseName = exeName.split(/[/\\]/).pop() || exeName;
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  // Transparent overlay over the menu bar for window-relative NC drawing
+  // (GetWindowDC on the main window — e.g. FreeCell's "Cards Left" counter).
+  const ncCanvasRef = useRef<HTMLCanvasElement>(null);
   const emuRef = useRef<Emulator | null>(null);
   const [menus, setMenus] = useState<MenuResult[]>([]);
   const detectedLang = langToHtmlLang(detectPELanguageId(peInfo.resources)) || undefined;
@@ -537,6 +540,30 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
     // Async init for registry + profiles, then start emulator
     let regFlushTimer: ReturnType<typeof setTimeout> | null = null;
     let profFlushTimer: ReturnType<typeof setTimeout> | null = null;
+    let regStoreRef: RegistryStore | null = null;
+    let profStoreRef: ProfileStore | null = null;
+    // Force any pending debounced writes out to IndexedDB immediately. Called
+    // on unmount and on page hide: apps that persist their settings while
+    // closing (e.g. in WM_DESTROY) write within the 500ms debounce window, so
+    // cancelling the timer instead of flushing would silently drop those writes.
+    const flushPendingPersistence = () => {
+      if (regFlushTimer !== null) { clearTimeout(regFlushTimer); regFlushTimer = null; }
+      if (regStoreRef) {
+        saveRegistry(regStoreRef.serialize()).catch(e =>
+          console.warn('[REG] Failed to save registry:', e)
+        );
+      }
+      if (profFlushTimer !== null) { clearTimeout(profFlushTimer); profFlushTimer = null; }
+      if (profStoreRef) {
+        saveProfiles(profStoreRef.serialize()).catch(e =>
+          console.warn('[PROF] Failed to save profiles:', e)
+        );
+      }
+    };
+    // The browser may close/refresh the tab without unmounting React first;
+    // flush on pagehide so a tab close right after a settings change isn't lost.
+    const onPageHide = () => flushPendingPersistence();
+    window.addEventListener('pagehide', onPageHide);
     const initAndRun = async () => {
       // Load registry, profiles, and virtual filesystem in parallel (independent IndexedDB reads)
       const [regData, profData] = await Promise.all([
@@ -547,6 +574,7 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
 
       // Set up registry store with IndexedDB persistence
       const regStore = new RegistryStore();
+      regStoreRef = regStore;
       if (regData) regStore.deserialize(regData);
       regStore.onChange = () => {
         if (regFlushTimer !== null) clearTimeout(regFlushTimer);
@@ -560,6 +588,7 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
 
       // Set up profile store with IndexedDB persistence
       const profStore = new ProfileStore();
+      profStoreRef = profStore;
       if (profData) profStore.deserialize(profData);
       profStore.onChange = () => {
         if (profFlushTimer !== null) clearTimeout(profFlushTimer);
@@ -586,6 +615,25 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
       emu.traceApi = dsPre.traceApi;
 
       await emu.load(arrayBuffer, peInfo, canvas);
+
+      // UPX-packed PEs hide their resources until the decompression stub has
+      // run, which happens inside emu.load(). emu-load.ts repopulates
+      // peInfo.resources / peInfo.sections and stores the unpacked image in
+      // emu.arrayBuffer. Re-extract menus + icons from that view so the UI
+      // gets the real menu bar and app icon for UPX exes (PabloDraw, etc.).
+      if (peInfo.isUpxPacked && emu.arrayBuffer) {
+        const postMenus = extractMenus(peInfo, emu.arrayBuffer);
+        if (postMenus.length > 0) {
+          setMenus(postMenus);
+          emu.menuItems = postMenus[0].menu.items;
+        }
+        const postIcons = extractIcons(peInfo, emu.arrayBuffer);
+        if (postIcons.length > 0) {
+          const url = URL.createObjectURL(postIcons[0].blob);
+          setIconUrl(url);
+          onIconChange?.(url);
+        }
+      }
     };
 
     try {
@@ -646,6 +694,7 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
 
       onSetupEmulator?.(emu);
 
+      emu.ncCanvas = ncCanvasRef.current;
       emuRef.current = emu;
       (globalThis as typeof globalThis & { __emu?: unknown }).__emu = emu;
       onRegisterCloseHandler?.(() => {
@@ -691,6 +740,32 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
       emu.onCloseDialog = () => setDialogInfo(null);
       emu.onControlsChanged = (controls: ControlOverlay[]) => setControlOverlays(controls);
       emu.onMenuChanged = () => setMenus(prev => [...prev]);
+      // Apps that build their menu at runtime (CreateMenu + AppendMenu, e.g.
+      // PabloDraw) only expose the structure via SetMenu(hwnd, hMenu). Walk
+      // the runtime InternalMenuItem tree once the main window's menu is set
+      // and convert it into the MenuResult[] shape the React MenuBar expects.
+      emu.onSetMenu = (hwnd, hMenu) => {
+        if (!emu.mainWindow || hwnd !== emu.mainWindow || !hMenu) return;
+        const seen = new Set<number>();
+        const toMenuItem = (it: { id: number; text: string; flags: number; hSubMenu: number }): import('../lib/pe/types').MenuItem => {
+          const isSeparator = !!(it.flags & 0x800); // MF_SEPARATOR
+          const isChecked = !!(it.flags & 0x08);
+          const isGrayed = !!(it.flags & 0x03);   // MF_GRAYED | MF_DISABLED
+          let children: import('../lib/pe/types').MenuItem[] | null = null;
+          if (it.hSubMenu && !seen.has(it.hSubMenu)) {
+            seen.add(it.hSubMenu);
+            const sub = emu.handles.get<{ items: { id: number; text: string; flags: number; hSubMenu: number }[] }>(it.hSubMenu);
+            if (sub?.items) children = sub.items.map(toMenuItem);
+          }
+          return { id: it.id, text: it.text || '', isSeparator, isChecked, isGrayed, isDefault: false, children };
+        };
+        const root = emu.handles.get<{ items: { id: number; text: string; flags: number; hSubMenu: number }[] }>(hMenu);
+        if (!root?.items?.length) return;
+        seen.add(hMenu);
+        const items = root.items.map(toMenuItem);
+        setMenus([{ id: null, name: null, languageId: 0, menu: { isExtended: false, items } }]);
+        emu.menuItems = items;
+      };
       emu.onShowCommonDialog = (req) => {
         setCommonDialog(req);
         setWindowReady(prev => { if (!prev) onReady?.(); return true; });
@@ -909,7 +984,10 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
 
     return () => {
       window.removeEventListener('desktop-files-changed', onDesktopChanged);
-      if (regFlushTimer !== null) clearTimeout(regFlushTimer);
+      window.removeEventListener('pagehide', onPageHide);
+      // Flush (not cancel) any debounced registry/profile writes so settings
+      // saved right before the app closed are persisted.
+      flushPendingPersistence();
       if (emuRef.current) {
         if (processRegistry && emuRef.current.pid) {
           processRegistry.unregister(emuRef.current.pid);
@@ -1200,6 +1278,10 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
     const rect = canvas.getBoundingClientRect();
     const x = Math.round((e.clientX - rect.left) * canvas.width / rect.width);
     const y = Math.round((e.clientY - rect.top) * canvas.height / rect.height);
+    // Cache the screen-coord cursor so GetCursorPos / GetMessagePos can read
+    // it without the app needing to receive a WM_MOUSEMOVE first.
+    emu.cursorX = x;
+    emu.cursorY = y;
     const wParam = buildMKFlags(e);
     if (emu.capturedWindow) {
       // Auto-release capture when no buttons pressed and cursor is outside the
@@ -1236,6 +1318,18 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
     } else {
       // Hit-test to find the correct child window and convert coordinates
       const hit = emu.windowFromPoint(x, y);
+      // Real Windows sends WM_MOUSEACTIVATE before the button message ONLY
+      // when the clicked window differs from the active window (Wine
+      // win32u/message.c: `if (msg->hwnd != info.hwndActive)`). Child views
+      // always get it (MFC CView::OnMouseActivate SetFocuses the view), but a
+      // click straight on the active top-level must NOT — apps like FreeCell
+      // answer MA_ACTIVATEANDEAT to swallow activation clicks, and sending it
+      // every time made them eat every click.
+      if ((msg === WM_LBUTTONDOWN || msg === WM_RBUTTONDOWN
+        || msg === WM_LBUTTONDBLCLK || msg === WM_RBUTTONDBLCLK)
+        && hit.hwnd !== emu.mainWindow) {
+        emu.postMessage(hit.hwnd, WM_MOUSEACTIVATE, emu.mainWindow, (msg << 16) | HTCLIENT);
+      }
       emu.postMessage(hit.hwnd, msg, wParam, makeLParam(hit.x, hit.y));
     }
   }, []);
@@ -1281,6 +1375,17 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
       if (vk === undefined) return;
       e.preventDefault();
       emu.keyStates.add(vk);
+      // Mirror the host toggle-key state (GetKeyState bit 0)
+      if (e.getModifierState) {
+        const VK_CAPITAL = 0x14, VK_NUMLOCK = 0x90, VK_SCROLL = 0x91;
+        const syncToggle = (mod: string, tvk: number) => {
+          if (e.getModifierState(mod)) emu.keyToggles.add(tvk);
+          else emu.keyToggles.delete(tvk);
+        };
+        syncToggle('CapsLock', VK_CAPITAL);
+        syncToggle('NumLock', VK_NUMLOCK);
+        syncToggle('ScrollLock', VK_SCROLL);
+      }
       // lParam: repeat count (1) | scanCode << 16 | extended << 24 | previous state << 30
       const scanCode = e.keyCode & 0xFF;
       const lParam = 1 | (scanCode << 16);
@@ -1502,6 +1607,27 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
   const hasModalDialog = !!(messageBoxes.length > 0 || dialogInfo || commonDialog);
   const parentFocused = focused && !hasModalDialog;
 
+  // Keyboard isolation from the desktop: the desktop div keeps DOM focus by
+  // default, so every keydown while typing into the emulator ALSO fired the
+  // desktop's onKeyDown (icon arrow-navigation, Enter re-launching the
+  // selected icon). Hold DOM focus on this window's root while it is the
+  // focused app — keydown events then target this div and never reach the
+  // desktop's handler. Form fields (DOM EDIT overlays, rename inputs) keep
+  // their focus: never steal from them.
+  const grabDomFocus = useCallback((e?: PointerEvent) => {
+    onFocus();
+    const target = (e?.target as HTMLElement | null) ?? null;
+    if (target && ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName)) return;
+    desktopRef.current?.focus({ preventScroll: true });
+  }, [onFocus]);
+
+  useEffect(() => {
+    if (!focused) return;
+    const ae = document.activeElement as HTMLElement | null;
+    if (ae && ['INPUT', 'TEXTAREA', 'SELECT'].includes(ae.tagName)) return;
+    desktopRef.current?.focus({ preventScroll: true });
+  }, [focused]);
+
   // Programs like winver.exe / ssmaze.scr /c have no main window — only show the message box / dialog
   if (!hasMainWindow && !isConsole && windowReady) {
     return (
@@ -1586,7 +1712,7 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
   void consoleLayoutBump; // dependency: re-evaluate when the layout changes
 
   return (
-    <div ref={desktopRef} style={{ position: 'absolute', left: `${windowPos.x}px`, top: `${windowPos.y}px`, zIndex, visibility: windowReady ? 'visible' : 'hidden', display: minimizedProp ? 'none' : undefined, touchAction: 'none' }} onPointerDown={onFocus}>
+    <div ref={desktopRef} tabIndex={-1} style={{ position: 'absolute', left: `${windowPos.x}px`, top: `${windowPos.y}px`, zIndex, visibility: windowReady ? 'visible' : 'hidden', display: minimizedProp ? 'none' : undefined, touchAction: 'none', outline: 'none' }} onPointerDown={grabDomFocus}>
       <Window
         title={windowTitle}
         style={windowStyle}
@@ -1599,7 +1725,19 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
         minimized={false}
         blocked={hasModalDialog}
         onBlockedClick={flashModal}
-        menus={<MenuBar menus={menus} onCommand={handleMenuCommand} onFocus={onFocus} onMenuOpen={handleMenuOpen} />}
+        menus={
+          <div style={{ position: 'relative' }}>
+            <MenuBar menus={menus} onCommand={handleMenuCommand} onFocus={onFocus} onMenuOpen={handleMenuOpen} />
+            <canvas
+              ref={(el: HTMLCanvasElement | null) => {
+                ncCanvasRef.current = el;
+                if (emuRef.current) emuRef.current.ncCanvas = el;
+              }}
+              height={19}
+              style={{ position: 'absolute', left: 0, top: 0, height: '19px', pointerEvents: 'none', imageRendering: 'pixelated' }}
+            />
+          </div>
+        }
         onClose={() => {
           const emu = emuRef.current;
           if (emu?.mainWindow) {

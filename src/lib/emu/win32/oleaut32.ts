@@ -95,6 +95,34 @@ export function registerOleaut32(emu: Emulator): void {
   oleaut32.register('SafeArrayGetUBound', 3, () => 0);
   // SafeArrayPtrOfIndex(psa, rgIndices, ppvData) — stub
   oleaut32.register('SafeArrayPtrOfIndex', 3, () => 0x80004005); // E_FAIL
+  // SafeArrayDestroy(psa) — stub
+  oleaut32.register('SafeArrayDestroy', 1, () => 0); // S_OK
+  // SafeArrayDestroyData(psa) — stub
+  oleaut32.register('SafeArrayDestroyData', 1, () => 0);
+  // SafeArrayDestroyDescriptor(psa) — stub
+  oleaut32.register('SafeArrayDestroyDescriptor', 1, () => 0);
+
+  // SysStringByteLen(BSTR) — returns length in bytes (mirrors SysStringLen but in bytes)
+  oleaut32.register('SysStringByteLen', 1, () => {
+    const bstr = emu.readArg(0);
+    if (!bstr) return 0;
+    return emu.memory.readU32(bstr - 4);
+  });
+
+  // OleTranslateColor(clr, hpal, pcolorref) — translate OLE_COLOR to COLORREF
+  // OLE_COLOR encoding: high byte 0=raw RGB, 1=palette index, 2=palette RGB, 0x80=system color index
+  oleaut32.register('OleTranslateColor', 3, () => {
+    const clr = emu.readArg(0) >>> 0;
+    const pcolorref = emu.readArg(2);
+    if (!pcolorref) return 0; // S_OK with null out is permissible per MSDN
+    let colorref = clr & 0xFFFFFF;
+    if ((clr & 0xFF000000) === 0x80000000) {
+      // System color index — fall back to mid-gray approximation
+      colorref = 0xC0C0C0;
+    }
+    emu.memory.writeU32(pcolorref, colorref);
+    return 0; // S_OK
+  });
 
   oleaut32.register('VariantCopy', 2, () => 0);
   oleaut32.register('VariantChangeType', 4, () => 0);
@@ -418,6 +446,51 @@ export function registerOleaut32(emu: Emulator): void {
     const d = new Date(ms);
     const str = d.toLocaleDateString('en-US');
     const bstr = allocBstrFromStr(str);
+    if (!bstr) return 0x8007000E;
+    emu.memory.writeU32(pbstrOut, bstr);
+    return S_OK;
+  });
+
+  // VarBstrFromR4(fltIn, lcid, dwFlags, pbstrOut)
+  oleaut32.register('VarBstrFromR4', 4, () => {
+    _f32u[0] = emu.readArg(0);
+    const pbstrOut = emu.readArg(3);
+    if (!pbstrOut) return DISP_E_TYPEMISMATCH;
+    const bstr = allocBstrFromStr(_f32[0].toString());
+    if (!bstr) return 0x8007000E;
+    emu.memory.writeU32(pbstrOut, bstr);
+    return S_OK;
+  });
+
+  // VarBstrFromR8(dblIn, lcid, dwFlags, pbstrOut) — dblIn takes 2 stack slots
+  oleaut32.register('VarBstrFromR8', 4, () => {
+    _u32[0] = emu.readArg(0);
+    _u32[1] = emu.readArg(1);
+    const pbstrOut = emu.readArg(4);
+    if (!pbstrOut) return DISP_E_TYPEMISMATCH;
+    const bstr = allocBstrFromStr(_f64[0].toString());
+    if (!bstr) return 0x8007000E;
+    emu.memory.writeU32(pbstrOut, bstr);
+    return S_OK;
+  });
+
+  // VarBstrFromI2(iIn, lcid, dwFlags, pbstrOut)
+  oleaut32.register('VarBstrFromI2', 4, () => {
+    const v = (emu.readArg(0) << 16) >> 16; // sign-extend 16-bit
+    const pbstrOut = emu.readArg(3);
+    if (!pbstrOut) return DISP_E_TYPEMISMATCH;
+    const bstr = allocBstrFromStr(v.toString());
+    if (!bstr) return 0x8007000E;
+    emu.memory.writeU32(pbstrOut, bstr);
+    return S_OK;
+  });
+
+  // VarBstrFromI4(lIn, lcid, dwFlags, pbstrOut)
+  oleaut32.register('VarBstrFromI4', 4, () => {
+    const v = emu.readArg(0) | 0; // signed 32-bit
+    const pbstrOut = emu.readArg(3);
+    if (!pbstrOut) return DISP_E_TYPEMISMATCH;
+    const bstr = allocBstrFromStr(v.toString());
     if (!bstr) return 0x8007000E;
     emu.memory.writeU32(pbstrOut, bstr);
     return S_OK;

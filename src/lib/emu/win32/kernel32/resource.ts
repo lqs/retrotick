@@ -102,4 +102,11 @@ export function registerResource(emu: Emulator): void {
 
   // EnumResourceNamesW(hModule, lpType, lpEnumFunc, lParam) → BOOL
   kernel32.register('EnumResourceNamesW', 4, () => 0);
+  kernel32.register('EnumResourceNamesA', 4, () => 0);
+  // EnumResourceTypesA/W(hModule, lpEnumFunc, lParam) → BOOL
+  kernel32.register('EnumResourceTypesA', 3, () => 0);
+  kernel32.register('EnumResourceTypesW', 3, () => 0);
+  // EnumResourceLanguagesA/W(hModule, lpType, lpName, lpEnumFunc, lParam) → BOOL
+  kernel32.register('EnumResourceLanguagesA', 5, () => 0);
+  kernel32.register('EnumResourceLanguagesW', 5, () => 0);
 }

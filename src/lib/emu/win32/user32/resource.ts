@@ -349,6 +349,32 @@ export function registerResource(emu: Emulator): void {
   user32.register('TranslateAcceleratorA', 3, translateAccelImpl);
   user32.register('TranslateAcceleratorW', 3, translateAccelImpl);
 
+  // HACCEL CreateAcceleratorTableA(LPACCEL paccel, int cAccel) — build a table from the array
+  function createAccelImpl(): number {
+    const paccel = emu.readArg(0);
+    const cAccel = emu.readArg(1);
+    const entries: { fVirt: number; key: number; cmd: number }[] = [];
+    if (paccel) {
+      for (let i = 0; i < cAccel; i++) {
+        const off = paccel + i * 6; // ACCEL: BYTE fVirt, WORD key, WORD cmd (+ 1 byte pad)
+        entries.push({
+          fVirt: emu.memory.readU8(off),
+          key: emu.memory.readU16(off + 2),
+          cmd: emu.memory.readU16(off + 4),
+        });
+      }
+    }
+    return emu.handles.alloc('accel', { entries });
+  }
+  user32.register('CreateAcceleratorTableA', 2, createAccelImpl);
+  user32.register('CreateAcceleratorTableW', 2, createAccelImpl);
+  user32.register('DestroyAcceleratorTable', 1, () => {
+    const h = emu.readArg(0);
+    if (h) emu.handles.free(h);
+    return 1;
+  });
+  user32.register('CopyAcceleratorTableA', 3, () => 0);
+
   user32.register('CreateIcon', 7, () => emu.handles.alloc('icon', {}));
   user32.register('DestroyIcon', 1, () => 1);
   user32.register('DestroyCursor', 1, () => 1);

@@ -1029,6 +1029,22 @@ export function renderControlOverlay(
     const texts = ctrl.statusTexts || [];
     const SBARS_SIZEGRIP = 0x0100;
     const hasSizeGrip = !!(ctrl.style & SBARS_SIZEGRIP);
+    // statusParts holds the panes' absolute right-edge positions (like Wine);
+    // -1 means "extend to the right edge". Validate them: a usable set is
+    // non-decreasing and within the bar width. MFC sometimes hands SB_SETPARTS a
+    // transient/garbage array (values that are clearly not coordinates), which
+    // would compute nonsensical pane widths and hide every pane. When the parts
+    // are not usable, fall back to the conventional MFC status-bar layout — the
+    // message pane (0) stretches, the indicator panes size to their content —
+    // so the text stays visible instead of vanishing off-screen.
+    const rawParts = ctrl.statusParts || [];
+    const barW = ctrl.width || 0;
+    const partsUsable = rawParts.length >= texts.length && rawParts.every((p: number, idx: number) => {
+      if (p === -1) return true;
+      if (!Number.isFinite(p) || p < 0 || p > barW + 2) return false;
+      const prev = rawParts[idx - 1];
+      return idx === 0 || prev === -1 || p >= prev - 1;
+    });
     return (
       <div key={ctrl.childHwnd} style={{
         ...posStyle, background: '#D4D0C8', boxSizing: 'border-box',
@@ -1037,17 +1053,19 @@ export function renderControlOverlay(
         borderTop: '1px solid #FFF',
       }}>
         {texts.map((t: string, i: number) => {
-          // statusParts contains absolute right-edge positions (like Wine).
-          // Value -1 means "extend to right edge". Compute width from positions.
-          const parts = ctrl.statusParts || [];
-          const rightEdge = (parts[i] != null && parts[i] !== -1) ? parts[i] : undefined;
-          const leftEdge = i === 0 ? 0 : (parts[i - 1] != null && parts[i - 1] !== -1 ? parts[i - 1] : undefined);
-          const w = (rightEdge != null && leftEdge != null) ? rightEdge - leftEdge : undefined;
+          let w: number | undefined;
+          if (partsUsable) {
+            const rightEdge = (rawParts[i] != null && rawParts[i] !== -1) ? rawParts[i] : undefined;
+            const leftEdge = i === 0 ? 0 : (rawParts[i - 1] != null && rawParts[i - 1] !== -1 ? rawParts[i - 1] : undefined);
+            w = (rightEdge != null && leftEdge != null) ? rightEdge - leftEdge : undefined;
+          }
+          // Fallback layout (parts unusable): pane 0 stretches, others fit text.
+          const stretch = partsUsable ? (w == null) : (i === 0);
           return (
             <div key={i} style={{
               width: w != null ? `${w}px` : undefined,
-              flex: w == null ? 1 : undefined,
-              flexShrink: w != null ? 0 : undefined,
+              flex: stretch ? 1 : undefined,
+              flexShrink: stretch ? undefined : 0,
               padding: '0 2px', margin: '0 1px',
               border: '1px solid', borderColor: '#808080 #FFF #FFF #808080',
               height: 'calc(100% - 2px)', display: 'flex', alignItems: 'center',

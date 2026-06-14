@@ -109,6 +109,10 @@ export function registerMenu(emu: Emulator): void {
     const hMenu = emu.readArg(1);
     const wnd = emu.handles.get<WindowInfo>(hwnd);
     if (wnd) wnd.hMenu = hMenu;
+    // Programs that build their menu at runtime (CreateMenu + AppendMenu, no
+    // RT_MENU resource) only become visible after SetMenu attaches the tree
+    // to a window. Notify the UI so it can re-read the runtime structure.
+    emu.onSetMenu?.(hwnd, hMenu);
     return 1;
   });
 
@@ -410,11 +414,12 @@ export function registerMenu(emu: Emulator): void {
       const prev = (item.flags & MF_CHECKED) ? MF_CHECKED : 0;
       if (uCheck & MF_CHECKED) item.flags |= MF_CHECKED;
       else item.flags &= ~MF_CHECKED;
-      // Sync to legacy menuItems for React UI
-      if (emu.menuItems) {
-        const legacy = byPos
-          ? findLegacyByPos(emu.menuItems, uIDCheckItem)
-          : findLegacyById(emu.menuItems, uIDCheckItem);
+      // Sync to legacy menuItems (React UI) by the resolved item's COMMAND ID.
+      // MF_BYPOSITION positions are relative to THIS submenu, not the flat
+      // top-level legacy array, so a by-position lookup there hit the wrong
+      // item (MFC's CCmdUI::SetCheck always uses MF_BYPOSITION).
+      if (emu.menuItems && item.id) {
+        const legacy = findLegacyById(emu.menuItems, item.id);
         if (legacy) legacy.isChecked = !!(uCheck & MF_CHECKED);
       }
       emu.onMenuChanged?.();
@@ -446,11 +451,10 @@ export function registerMenu(emu: Emulator): void {
       const prev = (item.flags & (MF_GRAYED | MF_DISABLED)) ? MF_GRAYED : 0;
       item.flags &= ~(MF_GRAYED | MF_DISABLED);
       item.flags |= (uEnable & (MF_GRAYED | MF_DISABLED));
-      // Sync to legacy menuItems for React UI
-      if (emu.menuItems) {
-        const legacy = byPos
-          ? findLegacyByPos(emu.menuItems, uIDEnableItem)
-          : findLegacyById(emu.menuItems, uIDEnableItem);
+      // Sync to legacy menuItems (React UI) by the resolved item's command id
+      // (MF_BYPOSITION positions are submenu-relative — see CheckMenuItem).
+      if (emu.menuItems && item.id) {
+        const legacy = findLegacyById(emu.menuItems, item.id);
         if (legacy) legacy.isGrayed = !!(uEnable & (MF_GRAYED | MF_DISABLED));
       }
       emu.onMenuChanged?.();
@@ -479,17 +483,14 @@ export function registerMenu(emu: Emulator): void {
       const byPos = !!(uFlags & MF_BYPOSITION);
       for (let i = idFirst; i <= idLast; i++) {
         const idx = findItemIndex(menu, i, byPos);
-        if (idx >= 0) {
-          if (i === idCheck) menu.items[idx].flags |= MF_CHECKED;
-          else menu.items[idx].flags &= ~MF_CHECKED;
-        }
-      }
-      // Sync to legacy menuItems for React UI
-      if (emu.menuItems) {
-        for (let i = idFirst; i <= idLast; i++) {
-          const legacy = byPos
-            ? findLegacyByPos(emu.menuItems, i)
-            : findLegacyById(emu.menuItems, i);
+        if (idx < 0) continue;
+        const it = menu.items[idx];
+        if (i === idCheck) it.flags |= MF_CHECKED;
+        else it.flags &= ~MF_CHECKED;
+        // Sync legacy by the resolved item's command id (positions are
+        // submenu-relative — see CheckMenuItem).
+        if (emu.menuItems && it.id) {
+          const legacy = findLegacyById(emu.menuItems, it.id);
           if (legacy) legacy.isChecked = (i === idCheck);
         }
       }

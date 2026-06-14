@@ -122,6 +122,18 @@ export function registerOle32(emu: Emulator): void {
   });
   ole32.register('RevokeDragDrop', 1, () => 0); // S_OK
   ole32.register('RegisterDragDrop', 2, () => 0); // S_OK
+  // BOOL IsAccelerator(HACCEL, int, LPMSG, WORD*) — return FALSE (no accel match)
+  ole32.register('IsAccelerator', 4, () => 0);
+  // HRESULT OleTranslateAccelerator(IOleInPlaceFrame*, LPOLEINPLACEFRAMEINFO, LPMSG)
+  ole32.register('OleTranslateAccelerator', 3, () => 0x00040002); // S_FALSE
+  // void CoFreeUnusedLibraries(void)
+  ole32.register('CoFreeUnusedLibraries', 0, () => 0);
+  // HRESULT CLSIDFromProgID(LPCOLESTR lpszProgID, LPCLSID pclsid)
+  ole32.register('CLSIDFromProgID', 2, () => 0x800401F3); // CO_E_CLASSSTRING
+  // HRESULT CoGetClassObject(REFCLSID, DWORD, COSERVERINFO*, REFIID, LPVOID*)
+  ole32.register('CoGetClassObject', 5, () => 0x80040154); // REGDB_E_CLASSNOTREG
+  // HRESULT StgOpenStorageOnILockBytes(ILockBytes*, IStorage*, DWORD, SNB, DWORD, IStorage**)
+  ole32.register('StgOpenStorageOnILockBytes', 6, () => 0x80004001); // E_NOTIMPL
 
   ole32.register('CoInitialize', 1, () => 0); // S_OK
   ole32.register('CoUninitialize', 0, () => 0);

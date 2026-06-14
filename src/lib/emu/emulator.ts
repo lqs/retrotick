@@ -292,6 +292,11 @@ export class Emulator {
   handles = new HandleTable();
   canvas: HTMLCanvasElement | null = null;
   canvasCtx: CanvasRenderingContext2D | null = null;
+  // Transparent overlay canvas over the DOM menu bar: receives window-relative
+  // GetWindowDC drawing that lands in the main window's non-client band
+  // (e.g. FreeCell paints "Cards Left" into its menu bar). Optional — without
+  // it, NC-band drawing is clipped out instead of polluting the client.
+  ncCanvas: HTMLCanvasElement | null = null;
   currentCursor = 0; // handle of current cursor
   glContext: GL1Context | null = null;
 
@@ -323,6 +328,9 @@ export class Emulator {
   _pendingReadConsole: { bufPtr: number; nCharsToRead: number; charsReadPtr: number } | null = null;
   _pendingReadConsoleInput: { bufPtr: number; nLength: number; eventsReadPtr: number; isWide: boolean } | null = null;
   _dispatchPaintUsedBeginPaint = false;
+  // Reentrancy guard: set while beginPaint is dispatching WM_ERASEBKGND so a
+  // handler that paints can't recurse into another erase dispatch.
+  _inEraseBkgnd = false;
   _pendingGetch = false;
   _consoleInputResume: { stackBytes: number; completer: (emu: Emulator, retVal: number, stackBytes: number) => void } | null = null;
   // Line editing state (emulates conhost line editing for ReadConsoleW with ENABLE_LINE_INPUT)
@@ -572,6 +580,20 @@ export class Emulator {
   ]);
   // Loaded DLL modules: dllName → module info
   loadedModules = new Map<string, { base: number; resourceRva: number; imageBase: number; sizeOfImage?: number }>();
+  // Stub-only system DLLs (no real PE) get unique pseudo-handles so GetProcAddress
+  // by ordinal can disambiguate the target DLL. base ↔ dllName (UPPERCASE)
+  stubDllByBase = new Map<number, string>();
+  stubDllHandles = new Map<string, number>();
+  nextStubDllHandle = 0x6FFE0000 >>> 0;
+  // Built-in message dispatcher (set by registerMessage in user32). DefWindowProcA
+  // delegates here for control-class messages like TB_*, EM_*, LB_*, CB_*, etc.,
+  // which MFC calls via DefWindowProc instead of SendMessage when subclassing.
+  dispatchBuiltinMessage: ((hwnd: number, message: number, wParam: number, lParam: number, wide?: boolean) => number | null) | null = null;
+  // True when we're inside a context (e.g. DispatchMessageA) that knows how to
+  // propagate `undefined` from emu.callWndProc to defer wndProc completion.
+  // Init-time JS handlers like CreateWindowExA are NOT async-aware, so they
+  // must run their callWndProc synchronously to completion (yields disabled).
+  _allowWndProcYield = false;
   // Loaded DLL exports: dllName (lowercase) → { base, exports[] }
   // Shared between startup pre-loading (emu-load.ts) and runtime LoadLibrary (kernel32/module.ts)
   loadedDllExports = new Map<string, { base: number; exports: { ordinal: number; name: string | null; rva: number; forwardedTo: string | null }[] }>();
@@ -703,6 +725,10 @@ export class Emulator {
   mainWindow = 0;
   capturedWindow = 0;
   focusedWindow = 0;
+  // Mouse cursor position in screen coordinates. Updated by mouse events on
+  // the canvas and by SetCursorPos; read by GetCursorPos and GetMessagePos.
+  cursorX = 0;
+  cursorY = 0;
   findState?: { term: string; lastIndex: number };
   // Exposed from wndproc.ts for RegisterWindowMessage dedup
   registerWindowMessage?: (name: string) => number;
@@ -712,9 +738,13 @@ export class Emulator {
   glSyncYieldedThisFrame = false;
   glSyncAwaitingSwap = false;
   keyStates = new Set<number>(); // Currently pressed virtual key codes
+  // Toggle-key state (GetKeyState bit 0): VK_CAPITAL / VK_NUMLOCK / VK_SCROLL.
+  // NumLock starts on, matching a Windows desktop boot; synced to the host
+  // keyboard state on each key event when the browser exposes it.
+  keyToggles = new Set<number>([0x90 /* VK_NUMLOCK */]);
   configuredLcid = 0x0409; // Set from regional settings at load time
   windowDCs = new Map<number, number>();
-  private timers = new Map<string, number>();
+  private timers = new Map<string, { jsTimer: number; elapse: number; timerFunc: number }>();
   /** Multimedia timers (timeSetEvent) — callback invoked during tick */
   _mmTimers = new Map<number, { callback: number; dwUser: number; delay: number; periodic: boolean; nextFire: number }>();
 
@@ -823,6 +853,7 @@ export class Emulator {
   onCloseDialog?: () => void;
   onControlsChanged?: (controls: ControlOverlay[]) => void;
   onMenuChanged?: () => void;
+  onSetMenu?: (hwnd: number, hMenu: number) => void;
   onCrash?: (eip: string, description: string) => void;
   onExit?: () => void;
   onReboot?: () => void;
@@ -1247,6 +1278,19 @@ export class Emulator {
         return;
       }
     }
+    if (message === 0x0200) { // WM_MOUSEMOVE
+      // Coalesce: Windows never queues multiple mouse moves — the queue holds
+      // only the latest position. Without this, a fast pointermove stream
+      // floods the queue faster than the emulated wndProc drains it, and
+      // clicks queued behind hundreds of moves respond seconds late. Only the
+      // TRAILING entry is replaced so ordering vs button events is preserved.
+      const last = queue.length > 0 ? queue[queue.length - 1] : null;
+      if (last && last.message === 0x0200 && last.hwnd === hwnd) {
+        last.wParam = wParam;
+        last.lParam = lParam;
+        return;
+      }
+    }
     queue.push({ hwnd, message, wParam, lParam });
     if (onAvail) {
       if (targetThread) targetThread._onMessageAvailable = null;
@@ -1256,15 +1300,19 @@ export class Emulator {
   }
 
   // Timer management
-  setWin32Timer(hwnd: number, id: number, jsTimer: number): void {
-    this.timers.set(`${hwnd}:${id}`, jsTimer);
+  setWin32Timer(hwnd: number, id: number, jsTimer: number, elapse = 0, timerFunc = 0): void {
+    this.timers.set(`${hwnd}:${id}`, { jsTimer, elapse, timerFunc });
+  }
+
+  getWin32Timer(hwnd: number, id: number): { jsTimer: number; elapse: number; timerFunc: number } | undefined {
+    return this.timers.get(`${hwnd}:${id}`);
   }
 
   clearWin32Timer(hwnd: number, id: number): void {
     const key = `${hwnd}:${id}`;
     const timer = this.timers.get(key);
     if (timer !== undefined) {
-      clearInterval(timer);
+      clearInterval(timer.jsTimer);
       this.timers.delete(key);
     }
   }
@@ -1350,7 +1398,7 @@ export class Emulator {
   getDC(hdc: number): DCInfo | null { return _getDC(this, hdc); }
   promoteToMainWindow(hwnd: number, wnd: WindowInfo): void { _promoteToMainWindow(this, hwnd, wnd); }
   setupCanvasSize(cw: number, ch: number): void { _setupCanvasSize(this, cw, ch); }
-  getWindowDC(hwnd: number): number { return _getWindowDC(this, hwnd); }
+  getWindowDC(hwnd: number, windowRelative = false): number { return _getWindowDC(this, hwnd, windowRelative); }
   beginPaint(hwnd: number): number { return _beginPaint(this, hwnd); }
   endPaint(hwnd: number, hdc: number): void { _endPaint(this, hwnd, hdc); }
   renderChildControls(hwnd: number): void { _renderChildControls(this, hwnd); }

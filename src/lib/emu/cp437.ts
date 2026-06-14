@@ -47,6 +47,29 @@ export function cp437ToChar(byte: number): string {
   return CP437_TABLE[byte & 0xFF];
 }
 
+// Reverse map: Unicode code point → CP437 byte. Built from CP437_TABLE so the
+// two never drift. Only the first byte that maps to a given code point wins
+// (the table has no duplicate printable code points in 0x20-0xFF).
+const UNICODE_TO_CP437 = new Map<number, number>();
+for (let b = 0; b < 256; b++) {
+  const cp = CP437_TABLE[b].codePointAt(0)!;
+  if (!UNICODE_TO_CP437.has(cp)) UNICODE_TO_CP437.set(cp, b);
+}
+
+/**
+ * Convert a Unicode code point to the CP437 byte that renders the same glyph,
+ * for keyboard input destined to DOS/OEM programs (their keyboard buffer and
+ * CP437 font expect OEM bytes, not Unicode). ASCII (≤0x7F) is identity. Code
+ * points with a CP437 equivalent (accented letters, box-drawing, symbols) map
+ * to that byte — e.g. 'à' U+00E0 → 0x85, 'é' U+00E9 → 0x82. Anything with no
+ * CP437 glyph falls back to the low byte (legacy behavior, no regression).
+ */
+export function unicodeToCp437(codePoint: number): number {
+  if (codePoint <= 0x7F) return codePoint;
+  const b = UNICODE_TO_CP437.get(codePoint);
+  return b !== undefined ? b : (codePoint & 0xFF);
+}
+
 /** Convert a CP437 byte array to a Unicode string */
 export function cp437ToString(bytes: Uint8Array | number[], start = 0, length?: number): string {
   const end = length !== undefined ? start + length : bytes.length;

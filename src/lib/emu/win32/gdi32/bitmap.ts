@@ -6,7 +6,7 @@ import {
 } from '../types';
 import type { DCInfo } from './types';
 import type { WindowInfo } from '../user32/types';
-import { colorToCSS, disableSmoothing } from './_helpers';
+import { colorToCSS, disableSmoothing, STOCK_BASE } from './_helpers';
 import { decodeDib } from '../../../pe/decode-dib';
 import { dcPutImageData } from '../../emu-window';
 import { resolvePaletteColors } from './palette';
@@ -157,7 +157,75 @@ export function registerBitmap(emu: Emulator): void {
 
   gdi32.register('GetObjectW', 3, emu.apiDefs.get('GDI32.DLL:GetObjectA')?.handler!);
 
-  gdi32.register('GetDIBits', 5, () => 0);
+  // int GetDIBits(HDC hdc, HBITMAP hbm, UINT start, UINT cLines,
+  //               LPVOID lpvBits, LPBITMAPINFO lpbmi, UINT usage)
+  // Reads pixels from a bitmap into the caller's BITMAPINFO + pixel buffer.
+  // When lpvBits is NULL, only fills the BITMAPINFOHEADER (and palette) —
+  // this is how MFC apps query "how big is this bitmap" before allocating
+  // pixel storage. NOTE: previous arg count was 5 — wrong, it's 7 (28 bytes),
+  // and the mismatch corrupted the stdcall stack on every call.
+  gdi32.register('GetDIBits', 7, () => {
+    const _hdc = emu.readArg(0);
+    const hbm = emu.readArg(1);
+    const startScan = emu.readArg(2);
+    const cLines = emu.readArg(3);
+    const lpvBits = emu.readArg(4);
+    const lpbmi = emu.readArg(5);
+    const _usage = emu.readArg(6);
+    const bmp = emu.handles.get<BitmapInfo>(hbm);
+    if (!bmp || !lpbmi) return 0;
+
+    const w = bmp.width, h = bmp.height;
+
+    // If lpvBits is NULL, just fill the header — Windows fills biWidth/Height
+    // /BitCount/SizeImage so caller can size a buffer.
+    if (!lpvBits) {
+      const requestedBpp = emu.memory.readU16(lpbmi + 14);
+      const bpp = requestedBpp || 32;
+      const stride = Math.floor((w * bpp + 31) / 32) * 4;
+      emu.memory.writeI32(lpbmi + 4, w);
+      emu.memory.writeI32(lpbmi + 8, h);
+      emu.memory.writeU16(lpbmi + 12, 1);
+      emu.memory.writeU16(lpbmi + 14, bpp);
+      emu.memory.writeU32(lpbmi + 16, 0);
+      emu.memory.writeU32(lpbmi + 20, stride * h);
+      return h;
+    }
+
+    // Read pixels from the bitmap canvas
+    const ctx = bmp.ctx || bmp.canvas.getContext('2d')!;
+    const imgData = ctx.getImageData(0, 0, w, h);
+    const px = imgData.data;
+    const bpp = emu.memory.readU16(lpbmi + 14) || 32;
+    const stride = Math.floor((w * bpp + 31) / 32) * 4;
+    // GetDIBits returns bottom-up by default
+    for (let scan = 0; scan < cLines; scan++) {
+      const dibRow = startScan + scan;
+      const srcY = (h - 1) - dibRow;
+      if (srcY < 0 || srcY >= h) continue;
+      const rowDst = lpvBits + dibRow * stride;
+      if (bpp === 32) {
+        for (let x = 0; x < w; x++) {
+          const off = (srcY * w + x) * 4;
+          emu.memory.writeU8(rowDst + x * 4 + 0, px[off + 2]);
+          emu.memory.writeU8(rowDst + x * 4 + 1, px[off + 1]);
+          emu.memory.writeU8(rowDst + x * 4 + 2, px[off + 0]);
+          emu.memory.writeU8(rowDst + x * 4 + 3, 0);
+        }
+      } else if (bpp === 24) {
+        for (let x = 0; x < w; x++) {
+          const off = (srcY * w + x) * 4;
+          emu.memory.writeU8(rowDst + x * 3 + 0, px[off + 2]);
+          emu.memory.writeU8(rowDst + x * 3 + 1, px[off + 1]);
+          emu.memory.writeU8(rowDst + x * 3 + 2, px[off + 0]);
+        }
+      } else {
+        return 0; // 1/4/8 bpp would need palette quantization — out of scope
+      }
+    }
+    emu.memory.writeU32(lpbmi + 20, stride * h);
+    return cLines;
+  });
 
   gdi32.register('SetDIBitsToDevice', 12, () => {
     const hdc = emu.readArg(0);
@@ -270,7 +338,115 @@ export function registerBitmap(emu: Emulator): void {
     return drawH;
   });
 
-  gdi32.register('StretchDIBits', 13, () => 0);
+  // int StretchDIBits(HDC hdc, int xDest, int yDest, int destW, int destH,
+  //                   int xSrc, int ySrc, int srcW, int srcH,
+  //                   const VOID *lpBits, const BITMAPINFO *lpbmi,
+  //                   UINT iUsage, DWORD rop)
+  // Used by MFC's CToolBar to copy a resource bitmap (DIB data fetched via
+  // FindResource/LockResource) into a CreateCompatibleBitmap canvas. Without
+  // a real implementation the toolbar buttons remain blank.
+  gdi32.register('StretchDIBits', 13, () => {
+    const hdc = emu.readArg(0);
+    const xDest = emu.readArg(1) | 0;
+    const yDest = emu.readArg(2) | 0;
+    const destW = emu.readArg(3) | 0;
+    const destH = emu.readArg(4) | 0;
+    const xSrc = emu.readArg(5) | 0;
+    const ySrc = emu.readArg(6) | 0;
+    const srcW = emu.readArg(7) | 0;
+    const srcH = emu.readArg(8) | 0;
+    const bitsPtr = emu.readArg(9);
+    const bmiPtr = emu.readArg(10);
+    const fuUsage = emu.readArg(11);
+    const _rop = emu.readArg(12);
+
+    const dc = emu.getDC(hdc);
+    if (!dc || !bitsPtr || !bmiPtr || srcW <= 0 || srcH <= 0 || destW === 0 || destH === 0) return 0;
+
+    const biSize = emu.memory.readU32(bmiPtr);
+    const biWidth = Math.abs(emu.memory.readI32(bmiPtr + 4));
+    const biHeight = emu.memory.readI32(bmiPtr + 8);
+    const biBitCount = emu.memory.readU16(bmiPtr + 14);
+    const biCompression = emu.memory.readU32(bmiPtr + 16);
+    const biClrUsed = emu.memory.readU32(bmiPtr + 32);
+    const isBottomUp = biHeight > 0;
+    if (biCompression !== 0) return 0;
+
+    const numColors = biClrUsed || (biBitCount <= 8 ? (1 << biBitCount) : 0);
+    let palette: [number, number, number][];
+    if (fuUsage === 1 && numColors > 0) {
+      palette = resolvePaletteColors(emu, dc, bmiPtr, biSize, numColors);
+    } else {
+      palette = [];
+      const paletteOffset = bmiPtr + biSize;
+      for (let i = 0; i < numColors; i++) {
+        const b = emu.memory.readU8(paletteOffset + i * 4);
+        const g = emu.memory.readU8(paletteOffset + i * 4 + 1);
+        const r = emu.memory.readU8(paletteOffset + i * 4 + 2);
+        palette.push([r, g, b]);
+      }
+    }
+
+    let paddedRow: number;
+    if (biBitCount === 1) paddedRow = ((Math.ceil(biWidth / 8)) + 3) & ~3;
+    else if (biBitCount === 4) paddedRow = ((Math.ceil(biWidth / 2)) + 3) & ~3;
+    else if (biBitCount === 8) paddedRow = (biWidth + 3) & ~3;
+    else if (biBitCount === 24) paddedRow = (biWidth * 3 + 3) & ~3;
+    else if (biBitCount === 32) paddedRow = biWidth * 4;
+    else return 0;
+
+    // Decode the source rect into an ImageData, then drawImage with stretching.
+    const imgData = dc.ctx.createImageData(srcW, srcH);
+    const px = imgData.data;
+    for (let y = 0; y < srcH; y++) {
+      const scanLine = isBottomUp ? (ySrc + srcH - 1 - y) : (ySrc + y);
+      if (scanLine < 0 || scanLine >= Math.abs(biHeight)) continue;
+      const rowStart = bitsPtr + scanLine * paddedRow;
+      for (let x = 0; x < srcW; x++) {
+        const sx = xSrc + x;
+        const off = (y * srcW + x) * 4;
+        let r = 0, g = 0, b = 0;
+        if (biBitCount === 4) {
+          const byteVal = emu.memory.readU8(rowStart + (sx >> 1));
+          const idx = (sx & 1) === 0 ? (byteVal >> 4) & 0x0F : byteVal & 0x0F;
+          [r, g, b] = palette[idx] || [0, 0, 0];
+        } else if (biBitCount === 8) {
+          const idx = emu.memory.readU8(rowStart + sx);
+          [r, g, b] = palette[idx] || [0, 0, 0];
+        } else if (biBitCount === 1) {
+          const idx = (emu.memory.readU8(rowStart + (sx >> 3)) >> (7 - (sx & 7))) & 1;
+          [r, g, b] = palette[idx] || [0, 0, 0];
+        } else if (biBitCount === 24) {
+          const srcOff = rowStart + sx * 3;
+          b = emu.memory.readU8(srcOff);
+          g = emu.memory.readU8(srcOff + 1);
+          r = emu.memory.readU8(srcOff + 2);
+        } else if (biBitCount === 32) {
+          const srcOff = rowStart + sx * 4;
+          b = emu.memory.readU8(srcOff);
+          g = emu.memory.readU8(srcOff + 1);
+          r = emu.memory.readU8(srcOff + 2);
+        }
+        px[off] = r; px[off + 1] = g; px[off + 2] = b; px[off + 3] = 255;
+      }
+    }
+
+    if (destW === srcW && destH === srcH) {
+      dcPutImageData(dc, imgData, xDest, yDest);
+    } else {
+      // Stretch via intermediate canvas + drawImage (handles negative dimensions = mirror)
+      const tmp = new OffscreenCanvas(srcW, srcH);
+      tmp.getContext('2d')!.putImageData(imgData, 0, 0);
+      const prevSmooth = dc.ctx.imageSmoothingEnabled;
+      dc.ctx.imageSmoothingEnabled = false;
+      const dx = destW < 0 ? xDest + destW : xDest;
+      const dy = destH < 0 ? yDest + destH : yDest;
+      dc.ctx.drawImage(tmp, dx, dy, Math.abs(destW), Math.abs(destH));
+      dc.ctx.imageSmoothingEnabled = prevSmooth;
+    }
+    emu.syncDCToCanvas(hdc);
+    return srcH;
+  });
   gdi32.register('GetBitmapBits', 3, () => 0);
 
   gdi32.register('BitBlt', 9, () => {
@@ -361,6 +537,16 @@ export function registerBitmap(emu: Emulator): void {
         putResult(getConvertedSrcData());
       } else {
         dstDC.ctx.drawImage(srcDC.canvas, xSrc, ySrc, width, height, xDst, yDst, width, height);
+      }
+      // Propagate RT_BITMAP origin from src DC's selected bitmap to dst bitmap
+      // when the BitBlt copies from a resource bitmap. MFC CToolBar uses this
+      // pattern: LoadBitmap → CreateCompatibleBitmap → BitBlt → TB_ADDBITMAP.
+      // renderToolbar then falls back to a direct resource reload if the compat
+      // bitmap canvas was lost in the transfer.
+      if (dstBmp && srcDC.selectedBitmapResId !== undefined
+          && dstBmp.resourceId === undefined) {
+        dstBmp.resourceId = srcDC.selectedBitmapResId;
+        dstBmp.resourceModule = srcDC.selectedBitmapResModule;
       }
     } else if (rop === NOTSRCCOPY) {
       const srcData = getConvertedSrcData();
@@ -488,7 +674,32 @@ export function registerBitmap(emu: Emulator): void {
   gdi32.register('GetSystemPaletteUse', 1, () => 1); // SYSPAL_STATIC
   gdi32.register('SetSystemPaletteUse', 2, () => 1); // prev value
   gdi32.register('SetDIBColorTable', 4, () => 0);
-  gdi32.register('GetObjectType', 1, () => 0);
+  // DWORD GetObjectType(HGDIOBJ h) — returns OBJ_* constant identifying the
+  // handle's GDI type. MFC's CGdiObject::FromHandlePermanent uses this to
+  // dispatch to the correct CGdiObject subclass; a stub of 0 makes MFC
+  // mistreat valid handles as invalid.
+  gdi32.register('GetObjectType', 1, () => {
+    const h = emu.readArg(0);
+    if (h >= STOCK_BASE) {
+      const idx = h - STOCK_BASE;
+      // Stock objects: WHITE_BRUSH..BLACK_BRUSH=0..4, NULL_BRUSH=5,
+      // WHITE_PEN=6, BLACK_PEN=7, NULL_PEN=8, OEM_FIXED_FONT..ANSI_VAR_FONT=10..13,
+      // DEFAULT_PALETTE=15, SYSTEM_FIXED_FONT=16, DEFAULT_GUI_FONT=17.
+      if (idx >= 0 && idx <= 5) return 2;            // OBJ_BRUSH
+      if (idx >= 6 && idx <= 8) return 1;            // OBJ_PEN
+      if (idx >= 10 && idx <= 17) return 6;          // OBJ_FONT
+      if (idx === 15) return 5;                       // OBJ_PAL
+      return 0;
+    }
+    const objType = emu.handles.getType(h);
+    if (objType === 'pen') return 1;
+    if (objType === 'brush') return 2;
+    if (objType === 'dc') return 3;       // OBJ_DC — caller can distinguish memdc via DC.hwnd==0
+    if (objType === 'palette') return 5;
+    if (objType === 'font') return 6;
+    if (objType === 'bitmap') return 7;
+    return 0;
+  });
   gdi32.register('SetDIBits', 7, () => {
     // SetDIBits(hdc, hbm, uStartScan, cScanLines, lpvBits, lpbmi, fuColorUse)
     const _hdc = emu.readArg(0);

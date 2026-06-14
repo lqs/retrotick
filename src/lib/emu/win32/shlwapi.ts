@@ -109,8 +109,22 @@ export function registerShlwapi(emu: Emulator): void {
     return pszFirst + idx * 2;
   });
 
-  // PathIsDirectoryW(pszPath) — 1 arg
-  shlwapi.register('PathIsDirectoryW', 1, () => 0); // not a directory
+  // PathIsDirectoryW / PathIsDirectoryA — query the file manager for the
+  // path's attributes and check the FILE_ATTRIBUTE_DIRECTORY bit. The stubs
+  // claimed everything was a file, breaking File→Open dialogs that recurse
+  // into the user's working directory.
+  const INVALID = 0xFFFFFFFF;
+  const FILE_ATTRIBUTE_DIRECTORY = 0x10;
+  const isDirectoryImpl = (wide: boolean) => (): number => {
+    const pszPath = emu.readArg(0);
+    if (!pszPath) return 0;
+    const path = wide ? emu.memory.readUTF16String(pszPath) : emu.memory.readCString(pszPath);
+    const attrs = emu.fileManager?.getFileAttributes(path, emu.additionalFiles) ?? INVALID;
+    if (attrs === INVALID) return 0;
+    return (attrs & FILE_ATTRIBUTE_DIRECTORY) ? 1 : 0;
+  };
+  shlwapi.register('PathIsDirectoryW', 1, isDirectoryImpl(true));
+  shlwapi.register('PathIsDirectoryA', 1, isDirectoryImpl(false));
 
   // PathFindExtensionW(pszPath) — 1 arg, returns pointer to '.' or end of string
   shlwapi.register('PathFindExtensionW', 1, () => {
@@ -128,8 +142,114 @@ export function registerShlwapi(emu: Emulator): void {
     return dotPtr || ptr; // return dot position or end of string
   });
 
-  // PathFileExistsW(pszPath) — 1 arg
-  shlwapi.register('PathFileExistsW', 1, () => 0); // file doesn't exist
+  // PathFileExistsW / PathFileExistsA — exists if getFileAttributes returns
+  // anything other than INVALID. Was stub→0, so every File→Open / installer
+  // path check reported "file missing" even for files we'd happily open.
+  const fileExistsImpl = (wide: boolean) => (): number => {
+    const pszPath = emu.readArg(0);
+    if (!pszPath) return 0;
+    const path = wide ? emu.memory.readUTF16String(pszPath) : emu.memory.readCString(pszPath);
+    const attrs = emu.fileManager?.getFileAttributes(path, emu.additionalFiles) ?? INVALID;
+    return attrs !== INVALID ? 1 : 0;
+  };
+  shlwapi.register('PathFileExistsW', 1, fileExistsImpl(true));
+  shlwapi.register('PathFileExistsA', 1, fileExistsImpl(false));
+
+  // LPSTR PathFindExtensionA(LPCSTR pszPath) — pointer to '.' or end of string
+  shlwapi.register('PathFindExtensionA', 1, () => {
+    const pszPath = emu.readArg(0);
+    if (!pszPath) return 0;
+    let ptr = pszPath;
+    let dotPtr = 0;
+    while (true) {
+      const ch = emu.memory.readU8(ptr);
+      if (ch === 0) break;
+      if (ch === 0x2E) dotPtr = ptr; // '.'
+      if (ch === 0x5C || ch === 0x2F) dotPtr = 0; // reset on path separator
+      ptr += 1;
+    }
+    return dotPtr || ptr;
+  });
+
+  // LPSTR PathFindFileNameA(LPCSTR pszPath) — pointer to filename after last separator
+  shlwapi.register('PathFindFileNameA', 1, () => {
+    const pszPath = emu.readArg(0);
+    if (!pszPath) return 0;
+    let ptr = pszPath;
+    let last = pszPath;
+    while (true) {
+      const ch = emu.memory.readU8(ptr);
+      if (ch === 0) break;
+      if (ch === 0x5C || ch === 0x2F || ch === 0x3A) last = ptr + 1; // '\', '/', ':'
+      ptr += 1;
+    }
+    return last;
+  });
+  shlwapi.register('PathFindFileNameW', 1, () => {
+    const pszPath = emu.readArg(0);
+    if (!pszPath) return 0;
+    let ptr = pszPath;
+    let last = pszPath;
+    while (true) {
+      const ch = emu.memory.readU16(ptr);
+      if (ch === 0) break;
+      if (ch === 0x5C || ch === 0x2F || ch === 0x3A) last = ptr + 2;
+      ptr += 2;
+    }
+    return last;
+  });
+
+  // BOOL PathStripToRootA(LPSTR pszPath) — truncate to drive root
+  shlwapi.register('PathStripToRootA', 1, () => {
+    const pszPath = emu.readArg(0);
+    if (!pszPath) return 0;
+    // Look for "X:\..." or "\\server\share\..."
+    const c0 = emu.memory.readU8(pszPath);
+    const c1 = emu.memory.readU8(pszPath + 1);
+    if (c0 === 0x5C && c1 === 0x5C) {
+      // UNC: keep up to "\\server\share"
+      let pos = 2;
+      let slashes = 0;
+      while (true) {
+        const ch = emu.memory.readU8(pszPath + pos);
+        if (ch === 0) { return slashes >= 2 ? 1 : 0; }
+        if (ch === 0x5C) {
+          slashes++;
+          if (slashes === 2) {
+            emu.memory.writeU8(pszPath + pos, 0);
+            return 1;
+          }
+        }
+        pos++;
+      }
+    }
+    if (c1 === 0x3A) {
+      // Drive letter: keep "X:\"
+      const c2 = emu.memory.readU8(pszPath + 2);
+      if (c2 === 0x5C) {
+        emu.memory.writeU8(pszPath + 3, 0);
+        return 1;
+      }
+    }
+    emu.memory.writeU8(pszPath, 0);
+    return 0;
+  });
+
+  // BOOL PathIsUNCA(LPCSTR pszPath) — UNC path begins with "\\"
+  shlwapi.register('PathIsUNCA', 1, () => {
+    const pszPath = emu.readArg(0);
+    if (!pszPath) return 0;
+    const c0 = emu.memory.readU8(pszPath);
+    const c1 = emu.memory.readU8(pszPath + 1);
+    return (c0 === 0x5C && c1 === 0x5C) ? 1 : 0;
+  });
+  shlwapi.register('PathIsUNCW', 1, () => {
+    const pszPath = emu.readArg(0);
+    if (!pszPath) return 0;
+    const c0 = emu.memory.readU16(pszPath);
+    const c1 = emu.memory.readU16(pszPath + 2);
+    return (c0 === 0x5C && c1 === 0x5C) ? 1 : 0;
+  });
 
   // PathAppendW(pszPath, pszMore) — 2 args
   shlwapi.register('PathAppendW', 2, () => {

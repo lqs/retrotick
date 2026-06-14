@@ -393,6 +393,17 @@ export function registerLocale(emu: Emulator): void {
   });
   kernel32.register('GetSystemDefaultLCID', 0, () => emu.configuredLcid);
   kernel32.register('GetThreadLocale', 0, () => emu.configuredLcid);
+  // LCID ConvertDefaultLocale(LCID Locale) — resolve LOCALE_USER_DEFAULT (0)
+  // and LOCALE_SYSTEM_DEFAULT (0x400) to the actual LCID; pass others through.
+  const LOCALE_USER_DEFAULT = 0x0400;
+  const LOCALE_SYSTEM_DEFAULT = 0x0800;
+  kernel32.register('ConvertDefaultLocale', 1, () => {
+    const lcid = emu.readArg(0);
+    if (lcid === 0 || lcid === LOCALE_USER_DEFAULT || lcid === LOCALE_SYSTEM_DEFAULT) {
+      return emu.configuredLcid;
+    }
+    return lcid;
+  });
   kernel32.register('IsDBCSLeadByte', 1, () => 0);
   kernel32.register('IsDBCSLeadByteEx', 2, () => 0);
   kernel32.register('GetUserDefaultLangID', 0, () => emu.configuredLcid & 0xFFFF);

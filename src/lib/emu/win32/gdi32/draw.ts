@@ -16,6 +16,28 @@ function bresenhamLine(ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingC
   }
 }
 
+/** Stroke a dashed/dotted line (PS_DASH..PS_DASHDOTDOT) via setLineDash. */
+function dashedLine(
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  x0: number, y0: number, x1: number, y1: number, css: string, style: number,
+): void {
+  ctx.save();
+  ctx.strokeStyle = css;
+  ctx.lineWidth = 1;
+  // PS_DASH=1, PS_DOT=2, PS_DASHDOT=3, PS_DASHDOTDOT=4
+  const dash = style === 2 ? [1, 1]
+    : style === 1 ? [3, 1]
+    : style === 3 ? [3, 1, 1, 1]
+    : [3, 1, 1, 1, 1, 1];
+  ctx.setLineDash(dash);
+  ctx.beginPath();
+  // +0.5 keeps a 1px axis-aligned line crisp on the canvas grid.
+  ctx.moveTo(x0 + 0.5, y0 + 0.5);
+  ctx.lineTo(x1 + 0.5, y1 + 0.5);
+  ctx.stroke();
+  ctx.restore();
+}
+
 /** Bresenham line that also writes to the palette index buffer */
 function bresenhamLinePal(
   ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
@@ -90,6 +112,8 @@ export function registerDraw(emu: Emulator): void {
           const palBuf = ensurePalIndexBuf(dc);
           const palIdx = getPaletteIdx(pen.color);
           bresenhamLinePal(dc.ctx, dc.penPosX, dc.penPosY, x, y, palBuf, cw, ch, palIdx + 1);
+        } else if (pen.style >= 1 && pen.style <= 4) {
+          dashedLine(dc.ctx, dc.penPosX, dc.penPosY, x, y, colorToCSS(pen.color), pen.style);
         } else {
           dc.ctx.fillStyle = colorToCSS(pen.color);
           bresenhamLine(dc.ctx, dc.penPosX, dc.penPosY, x, y);
@@ -490,7 +514,30 @@ export function registerDraw(emu: Emulator): void {
     return 1;
   });
 
-  gdi32.register('DPtoLP', 3, () => 1);
+  // DPtoLP(hdc, lpPoints, nCount) — device→logical, in place.
+  gdi32.register('DPtoLP', 3, () => {
+    const hdc = emu.readArg(0);
+    const lpPoints = emu.readArg(1);
+    const nCount = emu.readArg(2) | 0;
+    const dc = emu.getDC(hdc);
+    if (!dc || !lpPoints || nCount <= 0) return 0;
+    const mode = dc.mapMode ?? 1; // MM_TEXT
+    if (mode === 1) return 1;
+    const wEx = dc.windowExtX || 1, wEy = dc.windowExtY || 1;
+    const vEx = dc.viewportExtX || 1, vEy = dc.viewportExtY || 1;
+    const wOx = dc.windowOrgX || 0, wOy = dc.windowOrgY || 0;
+    const vOx = dc.viewportOrgX || 0, vOy = dc.viewportOrgY || 0;
+    for (let i = 0; i < nCount; i++) {
+      const px = lpPoints + i * 8;
+      const dx = emu.memory.readI32(px);
+      const dy = emu.memory.readI32(px + 4);
+      const lx = ((dx - vOx) * wEx) / vEx + wOx;
+      const ly = ((dy - vOy) * wEy) / vEy + wOy;
+      emu.memory.writeI32(px,     Math.round(lx));
+      emu.memory.writeI32(px + 4, Math.round(ly));
+    }
+    return 1;
+  });
   gdi32.register('SetMapperFlags', 2, () => 0);
   gdi32.register('AbortDoc', 1, () => 0);
 

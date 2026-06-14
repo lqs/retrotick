@@ -7,6 +7,21 @@ import { buildThunkTable } from '../../emu-thunks-pe';
 import { rebuildThunkPages } from '../../emu-load';
 import { emuCallDllMain, emuCompleteThunk } from '../../emu-exec';
 import type { FileInfo } from '../../file-manager';
+import { ordinalToName } from '../../dll-ordinals';
+
+/** Returns (or allocates) a unique pseudo-handle for a JS-stub-only system DLL.
+ *  Used so GetProcAddress(hModule, MAKEINTRESOURCE(N)) can map the ordinal back
+ *  to the correct DLL even though there is no real PE in memory. */
+function getOrCreateStubDllHandle(emu: Emulator, basename: string): number {
+  const upper = basename.toUpperCase();
+  const existing = emu.stubDllHandles.get(upper);
+  if (existing !== undefined) return existing;
+  const handle = emu.nextStubDllHandle;
+  emu.nextStubDllHandle = (emu.nextStubDllHandle + 0x10000) >>> 0;
+  emu.stubDllHandles.set(upper, handle);
+  emu.stubDllByBase.set(handle, upper);
+  return handle;
+}
 
 // Module-level type no longer needed — exports are stored on emu.loadedDllExports
 
@@ -282,8 +297,10 @@ function loadDll(emu: Emulator, rawName: string): number | undefined {
       }
       return 0;
     }
-    // Known system DLL with JS stubs — return imageBase so GetProcAddress works
-    return emu.pe.imageBase;
+    // Known system DLL with JS stubs — assign a unique pseudo-handle so that
+    // a later GetProcAddress(hModule, MAKEINTRESOURCE(N)) can disambiguate the
+    // target DLL and resolve the ordinal against the right name table.
+    return getOrCreateStubDllHandle(emu, basename);
   }
 
   try {
@@ -310,20 +327,26 @@ function findExport(emu: Emulator, hModule: number, funcName: string, ordinal: n
 export function registerModule(emu: Emulator): void {
   const kernel32 = emu.registerDll('KERNEL32.DLL');
 
+  function resolveModuleHandle(name: string): number {
+    let basename = name.replace(/^.*[\\/]/, '').toLowerCase();
+    if (basename && !basename.includes('.')) basename += '.dll';
+    const mod = emu.loadedModules.get(basename);
+    if (mod) return mod.base;
+    const stub = emu.stubDllHandles.get(basename.toUpperCase());
+    if (stub !== undefined) return stub;
+    return emu.pe.imageBase;
+  }
+
   kernel32.register('GetModuleHandleA', 1, () => {
     const namePtr = emu.readArg(0);
     if (namePtr === 0) return emu.pe.imageBase;
-    const name = emu.memory.readCString(namePtr).replace(/^.*[\\/]/, '').toLowerCase();
-    const mod = emu.loadedModules.get(name);
-    return mod ? mod.base : emu.pe.imageBase;
+    return resolveModuleHandle(emu.memory.readCString(namePtr));
   });
 
   kernel32.register('GetModuleHandleW', 1, () => {
     const namePtr = emu.readArg(0);
     if (namePtr === 0) return emu.pe.imageBase;
-    const name = emu.memory.readUTF16String(namePtr).replace(/^.*[\\/]/, '').toLowerCase();
-    const mod = emu.loadedModules.get(name);
-    return mod ? mod.base : emu.pe.imageBase;
+    return resolveModuleHandle(emu.memory.readUTF16String(namePtr));
   });
 
   function getModuleFileName(hModule: number): string {
@@ -337,6 +360,9 @@ export function registerModule(emu: Emulator): void {
         return 'C:\\WINDOWS\\SYSTEM32\\' + dllName.toUpperCase();
       }
     }
+    // Stub-DLL pseudo-handle
+    const stubName = emu.stubDllByBase.get(hModule);
+    if (stubName) return 'C:\\WINDOWS\\SYSTEM32\\' + stubName;
     return 'C:\\WINDOWS\\SYSTEM32\\UNKNOWN.DLL';
   }
 
@@ -371,6 +397,18 @@ export function registerModule(emu: Emulator): void {
       funcName = emu.memory.readCString(nameOrOrd);
     }
 
+    // If hModule is a stub-DLL pseudo-handle and we got an ordinal, translate
+    // it to the real API name using the per-DLL ordinal table. This unifies
+    // the by-ordinal and by-name lookups against the same apiDefs registry.
+    let stubDllName: string | undefined;
+    if (ordinal >= 0) {
+      stubDllName = emu.stubDllByBase.get(hModule);
+      if (stubDllName) {
+        const realName = ordinalToName(stubDllName, ordinal);
+        if (realName) funcName = realName;
+      }
+    }
+
     // Check loaded DLL exports first — returns real code address
     const exportAddr = findExport(emu, hModule, funcName, ordinal);
     if (exportAddr) {
@@ -383,33 +421,44 @@ export function registerModule(emu: Emulator): void {
       if (info.name === funcName) return addr;
     }
 
-    // Check if there's an API handler registered for any DLL
+    // Prefer a handler from the stub-DLL we identified above; fall back to a
+    // scan across all DLLs by name for callers that pass GetModuleHandle(NULL).
+    const tryCreateThunk = (dll: string, name: string): number | null => {
+      const key = `${dll}:${name}`;
+      const def = emu.apiDefs.get(key);
+      if (!def) return null;
+      for (const [addr, info] of emu.thunkToApi) {
+        if (info.dll === dll && info.name === name) return addr;
+      }
+      if (!emu.dynamicThunkPtr) return null;
+      const thunkAddr = emu.dynamicThunkPtr;
+      emu.dynamicThunkPtr += 4;
+      const stackBytes = def.stackBytes ?? 0;
+      emu.thunkToApi.set(thunkAddr, { dll, name, stackBytes });
+      emu.thunkPages.add(thunkAddr >>> 12);
+      console.log(`[GetProcAddress] Created dynamic thunk for ${dll}:${name} at 0x${thunkAddr.toString(16)} stackBytes=${stackBytes}`);
+      return thunkAddr;
+    };
+
+    if (stubDllName) {
+      const t = tryCreateThunk(stubDllName, funcName);
+      if (t !== null) return t;
+    }
+
     for (const key of emu.apiDefs.keys()) {
       const colonIdx = key.indexOf(':');
       if (colonIdx >= 0 && key.slice(colonIdx + 1) === funcName) {
         const dll = key.slice(0, colonIdx);
-        // Try existing thunk first
-        for (const [addr, info] of emu.thunkToApi) {
-          if (info.dll === dll && info.name === funcName) return addr;
-        }
-        // Create a dynamic thunk for this API
-        if (emu.dynamicThunkPtr) {
-          const thunkAddr = emu.dynamicThunkPtr;
-          emu.dynamicThunkPtr += 4;
-          const def = emu.apiDefs.get(key);
-          const stackBytes = def?.stackBytes ?? 0;
-          emu.thunkToApi.set(thunkAddr, { dll, name: funcName, stackBytes });
-          emu.thunkPages.add(thunkAddr >>> 12);
-          console.log(`[GetProcAddress] Created dynamic thunk for ${dll}:${funcName} at 0x${thunkAddr.toString(16)} stackBytes=${stackBytes}`);
-          return thunkAddr;
-        }
+        const t = tryCreateThunk(dll, funcName);
+        if (t !== null) return t;
       }
     }
 
     if (!emu._gpaNotFound) emu._gpaNotFound = new Set();
-    if (!emu._gpaNotFound.has(funcName)) {
-      emu._gpaNotFound.add(funcName);
-      console.log(`[GetProcAddress] Not found: "${funcName}"`);
+    const logKey = stubDllName ? `${stubDllName}:${funcName}` : funcName;
+    if (!emu._gpaNotFound.has(logKey)) {
+      emu._gpaNotFound.add(logKey);
+      console.log(`[GetProcAddress] Not found: "${logKey}"`);
     }
     return 0;
   });
@@ -452,9 +501,7 @@ export function registerModule(emu: Emulator): void {
       // GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS or NULL name
       hModule = emu.pe.imageBase;
     } else {
-      const name = emu.memory.readUTF16String(namePtr).replace(/^.*[\\/]/, '').toLowerCase();
-      const mod = emu.loadedModules.get(name);
-      hModule = mod ? mod.base : emu.pe.imageBase;
+      hModule = resolveModuleHandle(emu.memory.readUTF16String(namePtr));
     }
     if (phModule) emu.memory.writeU32(phModule, hModule);
     return 1;

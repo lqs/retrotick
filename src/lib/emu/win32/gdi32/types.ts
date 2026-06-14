@@ -35,6 +35,10 @@ export interface DCInfo {
   /** Number of unmatched SaveDC calls on this DC (like Wine's save_level).
    *  Used by releaseChildDC to pop all remaining saves when the DC is released. */
   saveLevel?: number;
+  /** RT_BITMAP resource ID of the currently selected bitmap (propagated through
+   *  SelectObject). Used by BitBlt to tag destination bitmaps. */
+  selectedBitmapResId?: number;
+  selectedBitmapResModule?: number;
 }
 
 export interface BitmapInfo {
@@ -48,6 +52,12 @@ export interface BitmapInfo {
   dibBpp?: number;      // bits per pixel of DIB section
   dimX?: number;        // logical dimension set by SetBitmapDimension
   dimY?: number;        // logical dimension set by SetBitmapDimension
+  /** RT_BITMAP resource ID. Set by loadBitmapResource* and propagated through
+   *  SelectObject/BitBlt so renderToolbar can fall back to a direct resource
+   *  reload when the canvas was lost in a CreateCompatibleBitmap copy chain. */
+  resourceId?: number;
+  /** Module handle (PE imageBase) of the resource source, for foreign-DLL bitmaps. */
+  resourceModule?: number;
 }
 
 export interface PenInfo {

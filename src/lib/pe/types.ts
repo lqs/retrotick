@@ -66,6 +66,10 @@ export interface PEInfo {
   isMZ?: boolean;
   mzHeader?: MZHeader;
   isCOM?: boolean;
+  /** Set when section names indicate UPX packing (UPX0/UPX1 or similar).
+   *  Resources, imports, and code are not yet present on disk — they exist
+   *  only after the runtime decompression stub finishes executing. */
+  isUpxPacked?: boolean;
 }
 
 export interface BitmapResult {

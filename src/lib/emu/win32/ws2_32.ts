@@ -10,13 +10,16 @@ export function registerWs2_32(emu: Emulator): void {
   const ws2_32 = emu.registerDll('WS2_32.DLL');
 
   ws2_32.register('WSAStartup', 2, () => {
-    const _version = emu.readArg(0);
+    // Per MSDN, WSAStartup negotiates: wsaData.wVersion = min(requested, highest_supported).
+    // MFC's AfxSocketInit requests MAKEWORD(1,1) and checks wVersion == 0x0101 — if we
+    // return 0x0202 the check fails. Echo the caller's requested version (capped at 2.2).
+    const requested = emu.readArg(0) & 0xFFFF;
+    const highest = 0x0202;
+    const negotiated = requested === 0 ? highest : Math.min(requested, highest);
     const wsaDataPtr = emu.readArg(1);
     if (wsaDataPtr) {
-      // Fill WSADATA structure minimally
-      emu.memory.writeU16(wsaDataPtr, 0x0202); // wVersion
-      emu.memory.writeU16(wsaDataPtr + 2, 0x0202); // wHighVersion
-      // Rest is zeroed (description, status, etc.)
+      emu.memory.writeU16(wsaDataPtr, negotiated);   // wVersion
+      emu.memory.writeU16(wsaDataPtr + 2, highest);  // wHighVersion
       for (let i = 4; i < WSADATA_SIZE; i++) {
         emu.memory.writeU8(wsaDataPtr + i, 0);
       }

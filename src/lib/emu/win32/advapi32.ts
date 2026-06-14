@@ -725,7 +725,45 @@ export function registerAdvapi32(emu: Emulator): void {
 
   advapi32.register('CopySid', 3, () => 1);
   advapi32.register('EqualSid', 2, () => 0);
-  advapi32.register('IsTextUnicode', 3, () => 0);
+  // IsTextUnicode(lpBuffer, iSize, lpiResult) — heuristic detection. Apps
+  // like Notepad call this with lpiResult = NULL (test everything, return
+  // combined result) when opening a file. The stub→0 meant every file looked
+  // like ANSI, so UTF-16-LE files opened as garbage. We honor the two cheap
+  // signature tests : FF FE BOM and statistics-by-null-byte pattern. Caller-
+  // requested test mask is preserved through lpiResult on output.
+  advapi32.register('IsTextUnicode', 3, () => {
+    const lpBuffer = emu.readArg(0);
+    const iSize = emu.readArg(1) | 0;
+    const lpiResult = emu.readArg(2);
+    const IS_TEXT_UNICODE_SIGNATURE          = 0x0008;
+    const IS_TEXT_UNICODE_REVERSE_SIGNATURE  = 0x0010;
+    const IS_TEXT_UNICODE_STATISTICS         = 0x0002;
+    const ALL_TESTS = 0xFFFF;
+    const requested = lpiResult ? (emu.memory.readU32(lpiResult) || ALL_TESTS) : ALL_TESTS;
+    let passed = 0;
+    if (lpBuffer && iSize >= 2) {
+      const b0 = emu.memory.readU8(lpBuffer);
+      const b1 = emu.memory.readU8(lpBuffer + 1);
+      if ((requested & IS_TEXT_UNICODE_SIGNATURE) && b0 === 0xFF && b1 === 0xFE) {
+        passed |= IS_TEXT_UNICODE_SIGNATURE;
+      }
+      if ((requested & IS_TEXT_UNICODE_REVERSE_SIGNATURE) && b0 === 0xFE && b1 === 0xFF) {
+        passed |= IS_TEXT_UNICODE_REVERSE_SIGNATURE;
+      }
+      if (requested & IS_TEXT_UNICODE_STATISTICS) {
+        // Cheap heuristic : even-indexed bytes look ASCII, odd-indexed bytes
+        // are mostly zero → likely UTF-16-LE plain ASCII content.
+        const sample = Math.min(iSize, 256);
+        let nullsOnOdd = 0;
+        for (let i = 1; i < sample; i += 2) if (emu.memory.readU8(lpBuffer + i) === 0) nullsOnOdd++;
+        if (sample >= 8 && nullsOnOdd > (sample / 2) * 0.7) {
+          passed |= IS_TEXT_UNICODE_STATISTICS;
+        }
+      }
+    }
+    if (lpiResult) emu.memory.writeU32(lpiResult, passed);
+    return passed !== 0 ? 1 : 0;
+  });
 
   // Security stubs
   advapi32.register('OpenProcessToken', 3, () => {
@@ -784,6 +822,21 @@ export function registerAdvapi32(emu: Emulator): void {
   });
 
   advapi32.register('AdjustTokenPrivileges', 6, () => 1);
+
+  // BOOL SetFileSecurityA(LPCSTR lpFileName, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR) — succeed
+  advapi32.register('SetFileSecurityA', 3, () => 1);
+  advapi32.register('SetFileSecurityW', 3, () => 1);
+  // BOOL GetFileSecurityA(LPCSTR, SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, DWORD, LPDWORD) — fail
+  advapi32.register('GetFileSecurityA', 5, () => {
+    const lengthNeeded = emu.readArg(4);
+    if (lengthNeeded) emu.memory.writeU32(lengthNeeded, 0);
+    return 0;
+  });
+  advapi32.register('GetFileSecurityW', 5, () => {
+    const lengthNeeded = emu.readArg(4);
+    if (lengthNeeded) emu.memory.writeU32(lengthNeeded, 0);
+    return 0;
+  });
 
   // Service Control Manager stubs
   advapi32.register('OpenSCManagerA', 3, () => 0x4000);

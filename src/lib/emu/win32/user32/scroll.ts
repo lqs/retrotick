@@ -1,4 +1,5 @@
 import type { Emulator } from '../../emulator';
+import type { WindowInfo } from './types';
 
 const SIF_RANGE = 0x0001;
 const SIF_PAGE = 0x0002;
@@ -23,12 +24,20 @@ export function registerScroll(emu: Emulator): void {
   const { memory } = emu;
   const scrollStates = new Map<string, ScrollState>();
 
+  // SB_HORZ=0, SB_VERT=1, SB_CTL=2
   function getState(hwnd: number, nBar: number): ScrollState {
     const key = getScrollKey(hwnd, nBar);
     let state = scrollStates.get(key);
     if (!state) {
       state = { nMin: 0, nMax: 0, nPage: 0, nPos: 0, nTrackPos: 0 };
       scrollStates.set(key, state);
+    }
+    // Mirror the SAME object onto the WindowInfo so the non-client scrollbar
+    // renderer sees live updates (nBar 0=horz, 1=vert).
+    const wnd = emu.handles.get<WindowInfo>(hwnd);
+    if (wnd) {
+      if (nBar === 0 && wnd.scrollH !== state) wnd.scrollH = state;
+      else if (nBar === 1 && wnd.scrollV !== state) wnd.scrollV = state;
     }
     return state;
   }

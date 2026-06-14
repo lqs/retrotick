@@ -288,13 +288,23 @@ export function dispatchException(
   return false;
 }
 
+let _divErrorDumpCount = 0;
 function raiseDivideError(cpu: CPU, instrEip: number): void {
   const csBase = (cpu.cs << 4) >>> 0;
   const ip = (instrEip - csBase) & 0xFFFF;
-  console.warn(`[DIV ERROR] at CS:IP=${cpu.cs.toString(16)}:${ip.toString(16)} (linear 0x${instrEip.toString(16)}) AX=0x${(cpu.reg[0] & 0xFFFF).toString(16)} BX=0x${(cpu.reg[3] & 0xFFFF).toString(16)} CX=0x${(cpu.reg[1] & 0xFFFF).toString(16)} DX=0x${(cpu.reg[2] & 0xFFFF).toString(16)}`);
+  console.warn(`[DIV ERROR] at CS:IP=${cpu.cs.toString(16)}:${ip.toString(16)} (linear 0x${instrEip.toString(16)}) EAX=0x${(cpu.reg[0] >>> 0).toString(16)} ECX=0x${(cpu.reg[1] >>> 0).toString(16)} EDX=0x${(cpu.reg[2] >>> 0).toString(16)} EBX=0x${(cpu.reg[3] >>> 0).toString(16)} ESP=0x${(cpu.reg[4] >>> 0).toString(16)} EBP=0x${(cpu.reg[5] >>> 0).toString(16)}`);
   const bytes: string[] = [];
   for (let i = 0; i < 8; i++) bytes.push(cpu.mem.readU8((instrEip + i) >>> 0).toString(16).padStart(2, '0'));
   console.warn(`[DIV ERROR] bytes: ${bytes.join(' ')}`);
+  // Dump the recent API/thunk call trace (last 64) for the first few faults so
+  // a single browser console copy reveals what the program was doing right
+  // before the divide — same diagnostic the WILD EIP path emits. Rate-limited
+  // so an app whose own #DE handler retries the faulting paint can't spam.
+  const emu = (cpu as unknown as { emu?: { diagThunkDump?: () => string } }).emu;
+  if (_divErrorDumpCount < 5 && emu?.diagThunkDump) {
+    _divErrorDumpCount++;
+    console.warn(`[DIV ERROR] THUNK TRACE (last API calls before fault):\n${emu.diagThunkDump()}`);
+  }
   cpu.eip = instrEip; // rewind to faulting instruction
   if (dispatchException(cpu, 0, 'exception')) return;
   cpu.haltReason = 'integer divide by zero';

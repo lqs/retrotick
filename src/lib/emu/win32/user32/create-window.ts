@@ -1,6 +1,6 @@
 import { type Emulator, getNextCascadePos } from '../../emulator';
 import type { WindowInfo } from './types';
-import { getClientSize, clampToMinTrackSize } from './_helpers';
+import { getClientSize, clientSizeOf, computeNcInset, clampToMinTrackSize, invalidateForResize } from './_helpers';
 import { buildMenuHandleTree } from './menu';
 import {
   WM_CREATE, WM_NCCREATE, WM_NCCALCSIZE, WM_SHOWWINDOW,
@@ -8,6 +8,24 @@ import {
   WM_NCDESTROY, WM_WINDOWPOSCHANGED,
   CW_USEDEFAULT,
 } from '../types';
+
+// A top-level window of a built-in CONTROL class is never an app's main
+// window on real Windows — it's a utility/message-pump window (e.g. calc.exe
+// creates a top-level WS_VISIBLE EDIT named "CalcMsgPumpWnd" before its real
+// Calculator dialog). Promoting it steals the main-window slot from the real
+// frame/dialog that follows. (#32770 dialogs stay promotable — dialog-based
+// apps are legitimate.)
+const NEVER_MAIN_CLASSES = new Set([
+  'BUTTON', 'EDIT', 'STATIC', 'LISTBOX', 'COMBOBOX', 'SCROLLBAR',
+  'TOOLTIPS_CLASS32', 'MSCTLS_HOTKEY32', 'MSCTLS_TRACKBAR32',
+  'MSCTLS_PROGRESS32', 'MSCTLS_STATUSBAR32', 'MSCTLS_UPDOWN32',
+  'SYSTABCONTROL32', 'SYSLISTVIEW32', 'SYSTREEVIEW32', 'SYSHEADER32',
+  'SYSANIMATE32', 'SYSLINK', 'TOOLBARWINDOW32', 'REBARWINDOW32',
+  'RICHEDIT20W', 'RICHEDIT20A', 'RICHEDIT',
+]);
+export function isUtilityWindowClass(wnd: WindowInfo): boolean {
+  return NEVER_MAIN_CLASSES.has((wnd.classInfo?.className ?? '').toUpperCase());
+}
 
 export function registerCreateWindow(emu: Emulator): void {
   const user32 = emu.registerDll('USER32.DLL');
@@ -54,16 +72,26 @@ export function registerCreateWindow(emu: Emulator): void {
     }
 
     // Handle CW_USEDEFAULT — when x is CW_USEDEFAULT for an overlapped window,
-    // Windows uses defaults for all of x, y, width, height
+    // Windows uses defaults for all of x, y, width, height. The size default
+    // is ~75% of the work area (Win32 docs: "system default size"), not a
+    // hardcoded 320x240; small apps look right at small sizes, but framed MFC
+    // apps with docked toolbars + a canvas (PabloDraw) need a real default.
+    // Open framed apps wide enough that a typical document view (CScrollView)
+    // fits without a horizontal scrollbar: a too-small default makes the editor
+    // narrower than its content, forcing a scrollbar and clipping margin guides.
+    // Capped to the available desktop so it never exceeds the screen.
+    const sw0 = emu.screenWidth || 1024, sh0 = emu.screenHeight || 768;
+    const defaultW = Math.min(sw0, Math.max(1024, Math.floor(sw0 * 0.85)));
+    const defaultH = Math.min(sh0, Math.max(640, Math.floor(sh0 * 0.85)));
     if (x === (CW_USEDEFAULT | 0) && !(style & 0x40000000)) {
       const pos = cls.wndProc ? getNextCascadePos(emu.screenWidth, emu.screenHeight) : { x: 0, y: 0 };
       x = pos.x;
       y = y === (CW_USEDEFAULT | 0) ? pos.y : y;
-      if ((width | 0) === (CW_USEDEFAULT | 0) || width === 0) width = 320;
-      if ((height | 0) === (CW_USEDEFAULT | 0) || height === 0) height = 240;
+      if ((width | 0) === (CW_USEDEFAULT | 0) || width === 0) width = defaultW;
+      if ((height | 0) === (CW_USEDEFAULT | 0) || height === 0) height = defaultH;
     } else {
-      if ((width | 0) === (CW_USEDEFAULT | 0)) width = 320;
-      if ((height | 0) === (CW_USEDEFAULT | 0)) height = 240;
+      if ((width | 0) === (CW_USEDEFAULT | 0)) width = defaultW;
+      if ((height | 0) === (CW_USEDEFAULT | 0)) height = defaultH;
       if (y === (CW_USEDEFAULT | 0)) y = 0;
     }
 
@@ -109,7 +137,8 @@ export function registerCreateWindow(emu: Emulator): void {
     }
 
     // Set as main window for parentless windows with actual size
-    if ((!hParent || hParent === 0) && width > 0 && height > 0 && emu.mainWindow === 0) {
+    if ((!hParent || hParent === 0) && width > 0 && height > 0 && emu.mainWindow === 0
+      && !isUtilityWindowClass(wnd)) {
       emu.promoteToMainWindow(hwnd, wnd);
     }
     // If current mainWindow is an invisible/zero-size WS_POPUP (e.g. Delphi TApplication),
@@ -141,20 +170,38 @@ export function registerCreateWindow(emu: Emulator): void {
 
     // Fire CBT hooks (HCBT_CREATEWND = 3) before WM_NCCREATE
     // CBT_CREATEWND: { CREATESTRUCT* lpcs; HWND hwndInsertAfter; }
+    // CBTProc takes 3 args (nCode, wParam, lParam) → callCallback (NOT callWndProc,
+    // which expects a 4-arg WndProc and would leave a 4-byte stack imbalance after
+    // the hook's `ret 0xC` runs against our 4-arg push, corrupting the caller's
+    // retAddr slot).
     if (emu.cbtHooks.length > 0) {
       const cbtStruct = emu.allocHeap(8);
       emu.memory.writeU32(cbtStruct, createStructAddr);
       emu.memory.writeU32(cbtStruct + 4, 0); // hwndInsertAfter
       for (const hook of emu.cbtHooks) {
-        emu.callWndProc(hook.lpfn, 3, hwnd, cbtStruct, 0);
+        emu.callCallback(hook.lpfn, [3, hwnd, cbtStruct]);
       }
     }
 
     // Send WM_NCCREATE, WM_NCCALCSIZE, WM_CREATE synchronously
     // Use wnd.wndProc (not cls.wndProc) since WM_NCCREATE handler may subclass the window
-    emu.callWndProc(wnd.wndProc, hwnd, WM_NCCREATE, 0, createStructAddr);
-    emu.callWndProc(wnd.wndProc, hwnd, WM_NCCALCSIZE, 0, 0);
-    const createResult = emu.callWndProc(wnd.wndProc, hwnd, WM_CREATE, 0, createStructAddr);
+    if (wnd.wndProc) {
+      emu.callWndProc(wnd.wndProc, hwnd, WM_NCCREATE, 0, createStructAddr);
+      // Real WM_NCCALCSIZE: pass the window rect, capture any custom client
+      // inset (control-bar grippers/edges) the handler reserves.
+      computeNcInset(emu, hwnd, wnd);
+    } else if (emu.dispatchBuiltinMessage) {
+      // Built-in controls (msctls_statusbar32, toolbarwindow32, …) have
+      // wndProc=0; callStdcall(0,…) returns 0 without dispatching, so their
+      // class-specific NCCREATE/NCCALCSIZE setup never ran. Route through the
+      // built-in handler so a status bar can seed its default height, a
+      // toolbar can reset its button list, etc.
+      emu.dispatchBuiltinMessage(hwnd, WM_NCCREATE, 0, createStructAddr, false);
+      emu.dispatchBuiltinMessage(hwnd, WM_NCCALCSIZE, 0, 0, false);
+    }
+    const createResult = wnd.wndProc
+      ? emu.callWndProc(wnd.wndProc, hwnd, WM_CREATE, 0, createStructAddr)
+      : (emu.dispatchBuiltinMessage?.(hwnd, WM_CREATE, 0, createStructAddr, false) ?? 0);
     console.log(`[WND] WM_CREATE result=${createResult} for hwnd=0x${hwnd.toString(16)} class="${className}"`);
 
     if (createResult === -1) {
@@ -193,17 +240,26 @@ export function registerCreateWindow(emu: Emulator): void {
     }
 
     // Handle CW_USEDEFAULT — when x is CW_USEDEFAULT for an overlapped window,
-    // Windows uses defaults for all of x, y, width, height
+    // Windows uses defaults for all of x, y, width, height. The size default
+    // is ~75% of the work area (Win32 docs: "system default size"), not a
+    // hardcoded 320x240; framed MFC apps need a real default.
     const WS_CHILD = 0x40000000;
+    // Open framed apps wide enough that a typical document view (CScrollView)
+    // fits without a horizontal scrollbar: a too-small default makes the editor
+    // narrower than its content, forcing a scrollbar and clipping margin guides.
+    // Capped to the available desktop so it never exceeds the screen.
+    const sw0 = emu.screenWidth || 1024, sh0 = emu.screenHeight || 768;
+    const defaultW = Math.min(sw0, Math.max(1024, Math.floor(sw0 * 0.85)));
+    const defaultH = Math.min(sh0, Math.max(640, Math.floor(sh0 * 0.85)));
     if (x === (CW_USEDEFAULT | 0) && !(style & WS_CHILD)) {
       const pos = cls.wndProc ? getNextCascadePos(emu.screenWidth, emu.screenHeight) : { x: 0, y: 0 };
       x = pos.x;
       y = y === (CW_USEDEFAULT | 0) ? pos.y : y;
-      if ((width | 0) === (CW_USEDEFAULT | 0) || width === 0) width = 320;
-      if ((height | 0) === (CW_USEDEFAULT | 0) || height === 0) height = 240;
+      if ((width | 0) === (CW_USEDEFAULT | 0) || width === 0) width = defaultW;
+      if ((height | 0) === (CW_USEDEFAULT | 0) || height === 0) height = defaultH;
     } else {
-      if ((width | 0) === (CW_USEDEFAULT | 0)) width = 320;
-      if ((height | 0) === (CW_USEDEFAULT | 0)) height = 240;
+      if ((width | 0) === (CW_USEDEFAULT | 0)) width = defaultW;
+      if ((height | 0) === (CW_USEDEFAULT | 0)) height = defaultH;
       if (y === (CW_USEDEFAULT | 0)) y = 0;
     }
     // Clamp absurd sizes (e.g. from corrupted registry data)
@@ -248,7 +304,8 @@ export function registerCreateWindow(emu: Emulator): void {
       }
     }
 
-    if ((!hParent || hParent === 0) && width > 0 && height > 0 && emu.mainWindow === 0) {
+    if ((!hParent || hParent === 0) && width > 0 && height > 0 && emu.mainWindow === 0
+      && !isUtilityWindowClass(wnd)) {
       emu.promoteToMainWindow(hwnd, wnd);
     }
     const WS_POPUP_CW = 0x80000000;
@@ -275,19 +332,29 @@ export function registerCreateWindow(emu: Emulator): void {
     emu.memory.writeU32(createStructAddr + 40, classNamePtr);
     emu.memory.writeU32(createStructAddr + 44, exStyle);
 
-    // Fire CBT hooks (HCBT_CREATEWND = 3) before WM_NCCREATE
+    // Fire CBT hooks (HCBT_CREATEWND = 3) before WM_NCCREATE — see comment in
+    // CreateWindowExA above; CBTProc is 3-arg, must use callCallback.
     if (emu.cbtHooks.length > 0) {
       const cbtStruct = emu.allocHeap(8);
       emu.memory.writeU32(cbtStruct, createStructAddr);
       emu.memory.writeU32(cbtStruct + 4, 0);
       for (const hook of emu.cbtHooks) {
-        emu.callWndProc(hook.lpfn, 3, hwnd, cbtStruct, 0);
+        emu.callCallback(hook.lpfn, [3, hwnd, cbtStruct]);
       }
     }
 
-    emu.callWndProc(wnd.wndProc, hwnd, WM_NCCREATE, 0, createStructAddr);
-    emu.callWndProc(wnd.wndProc, hwnd, WM_NCCALCSIZE, 0, 0);
-    const createResult = emu.callWndProc(wnd.wndProc, hwnd, WM_CREATE, 0, createStructAddr);
+    if (wnd.wndProc) {
+      emu.callWndProc(wnd.wndProc, hwnd, WM_NCCREATE, 0, createStructAddr);
+      // Real WM_NCCALCSIZE: pass the window rect, capture any custom client
+      // inset (control-bar grippers/edges) the handler reserves.
+      computeNcInset(emu, hwnd, wnd);
+    } else if (emu.dispatchBuiltinMessage) {
+      emu.dispatchBuiltinMessage(hwnd, WM_NCCREATE, 0, createStructAddr, true);
+      emu.dispatchBuiltinMessage(hwnd, WM_NCCALCSIZE, 0, 0, true);
+    }
+    const createResult = wnd.wndProc
+      ? emu.callWndProc(wnd.wndProc, hwnd, WM_CREATE, 0, createStructAddr)
+      : (emu.dispatchBuiltinMessage?.(hwnd, WM_CREATE, 0, createStructAddr, true) ?? 0);
     console.log(`[WND] WM_CREATE result=${createResult} for hwnd=0x${hwnd.toString(16)} class="${className}"`);
     if (createResult === -1) {
       emu.handles.free(hwnd);
@@ -338,6 +405,12 @@ export function registerCreateWindow(emu: Emulator): void {
     const SW_HIDE = 0, SW_SHOWNORMAL = 1, SW_SHOWMINIMIZED = 2, SW_MAXIMIZE = 3;
     const SW_SHOW = 5, SW_MINIMIZE = 6, SW_RESTORE = 9;
     wnd.visible = nCmdShow !== SW_HIDE;
+    // Keep the WS_VISIBLE style bit in sync. Code that queries visibility via
+    // GetWindowLong(GWL_STYLE)/GetStyle (e.g. MFC's CControlBar::IsVisible used
+    // by CDockBar layout) reads this bit, not our boolean — leaving it set after
+    // SW_HIDE makes a hidden window still reserve its layout slot.
+    const WS_VISIBLE = 0x10000000;
+    if (wnd.visible) wnd.style |= WS_VISIBLE; else wnd.style &= ~WS_VISIBLE;
 
     // Update minimized/maximized state
     if (nCmdShow === SW_MINIMIZE || nCmdShow === SW_SHOWMINIMIZED) {
@@ -352,7 +425,7 @@ export function registerCreateWindow(emu: Emulator): void {
     const WS_CHILD = 0x40000000;
     const WS_POPUP_SW = 0x80000000;
     if (wnd.visible && wnd.width > 0 && wnd.height > 0 && !(wnd.style & WS_CHILD)) {
-      if (emu.mainWindow === 0) {
+      if (emu.mainWindow === 0 && !isUtilityWindowClass(wnd)) {
         console.log(`[WND] ShowWindow promoting 0x${hwnd.toString(16)} to mainWindow`);
         emu.promoteToMainWindow(hwnd, wnd);
       } else if (!(wnd.style & WS_POPUP_SW) && hwnd !== emu.mainWindow) {
@@ -391,7 +464,7 @@ export function registerCreateWindow(emu: Emulator): void {
 
     // Send WM_SHOWWINDOW, WM_SIZE (with client area dims), WM_ACTIVATE
     emu.callWndProc(wnd.wndProc, hwnd, WM_SHOWWINDOW, wnd.visible ? 1 : 0, 0);
-    const { cw, ch } = getClientSize(wnd.style, wnd.hMenu !== 0, wnd.width, wnd.height);
+    const { cw, ch } = clientSizeOf(wnd);
     emu.callWndProc(wnd.wndProc, hwnd, WM_SIZE, 0,
       ((ch & 0xFFFF) << 16) | (cw & 0xFFFF));
     if (wnd.visible) {
@@ -415,12 +488,13 @@ export function registerCreateWindow(emu: Emulator): void {
     const wnd = emu.handles.get<WindowInfo>(hwnd);
     if (!wnd) return 0;
 
-    // Only send WM_PAINT if window needs repainting
-    if (wnd.needsPaint) {
-      if (wnd.needsErase) {
-        wnd.needsErase = false;
-        emu.callWndProc(wnd.wndProc, hwnd, WM_ERASEBKGND, emu.getWindowDC(hwnd), 0);
-      }
+    // Real UpdateWindow sends only WM_PAINT (synchronously, bypassing the
+    // queue) when the update region is non-empty. The erase belongs to
+    // BeginPaint, which dispatches WM_ERASEBKGND with the paint DC and
+    // releases it at EndPaint — leave needsErase set for it. Dispatching
+    // WM_ERASEBKGND here with a getWindowDC-armed wParam leaked the arm
+    // (save+clip on the shared canvas that nothing ever released).
+    if (wnd.needsPaint && wnd.wndProc) {
       emu.callWndProc(wnd.wndProc, hwnd, WM_PAINT, 0, 0);
     }
     return 1;
@@ -437,9 +511,10 @@ export function registerCreateWindow(emu: Emulator): void {
     const wnd = emu.handles.get<WindowInfo>(hwnd);
     if (wnd) {
       const clamped = clampToMinTrackSize(emu, hwnd, wnd, w, h);
-      console.log(`[MoveWindow] hwnd=0x${hwnd.toString(16)} x=${x} y=${y} w=${clamped.w} h=${clamped.h}`);
+      const sizeChanged = wnd.width !== clamped.w || wnd.height !== clamped.h;
       wnd.x = x; wnd.y = y; wnd.width = clamped.w; wnd.height = clamped.h;
-      const { cw, ch } = getClientSize(wnd.style, wnd.hMenu !== 0, clamped.w, clamped.h);
+      if (sizeChanged) computeNcInset(emu, hwnd, wnd);
+      const { cw, ch } = clientSizeOf(wnd);
       if (hwnd === emu.mainWindow) {
         emu.setupCanvasSize(cw, ch);
       }
@@ -447,8 +522,11 @@ export function registerCreateWindow(emu: Emulator): void {
       // Send WM_SIZE with client area dimensions
       const lParam = ((ch & 0xFFFF) << 16) | (cw & 0xFFFF);
       emu.callWndProc(wnd.wndProc, hwnd, WM_SIZE, 0, lParam);
-      // Trigger repaint if requested
-      if (repaint && wnd) {
+      // MoveWindow with bRepaint invalidates the full (new) client; clearing
+      // any stale partial invalidRect captured at the previous size.
+      if (repaint && sizeChanged) {
+        invalidateForResize(emu, wnd);
+      } else if (repaint) {
         wnd.needsPaint = true;
         wnd.needsErase = true;
       }
@@ -466,7 +544,7 @@ export function registerCreateWindow(emu: Emulator): void {
     const uFlags = emu.readArg(6);
     const wnd = emu.handles.get<WindowInfo>(hwnd);
     if (!wnd) return 0;
-    const SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_FRAMECHANGED = 0x20;
+    const SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOREDRAW = 0x8, SWP_FRAMECHANGED = 0x20;
     const SWP_SHOWWINDOW = 0x40, SWP_HIDEWINDOW = 0x80;
     let sizeChanged = false;
 
@@ -502,7 +580,9 @@ export function registerCreateWindow(emu: Emulator): void {
     }
 
     if ((uFlags & SWP_FRAMECHANGED) || sizeChanged) {
-      const { cw, ch } = getClientSize(wnd.style, wnd.hMenu !== 0, wnd.width, wnd.height);
+      // A frame/size change can change the custom non-client inset; recompute.
+      if (((uFlags & SWP_FRAMECHANGED) || sizeChanged)) computeNcInset(emu, hwnd, wnd);
+      const { cw, ch } = clientSizeOf(wnd);
       if (hwnd === emu.mainWindow) {
         emu.setupCanvasSize(cw, ch);
         emu.onWindowChange?.(wnd);
@@ -513,6 +593,11 @@ export function registerCreateWindow(emu: Emulator): void {
         emu.callWndProc(wnd.wndProc, hwnd, WM_SIZE, 0,
           ((ch & 0xFFFF) << 16) | (cw & 0xFFFF));
       }
+    }
+
+    // A resize without SWP_NOREDRAW invalidates the (new) client area in full.
+    if (sizeChanged && !(uFlags & SWP_NOREDRAW)) {
+      invalidateForResize(emu, wnd);
     }
 
     // Invalidate cached popup DC so it picks up the new position
@@ -528,8 +613,21 @@ export function registerCreateWindow(emu: Emulator): void {
   });
   user32.register('BringWindowToTop', 1, () => 1);
   user32.register('GetDesktopWindow', 0, () => 0);
-  user32.register('IsWindow', 1, () => 1);
-  user32.register('IsWindowVisible', 1, () => 1);
+  // IsWindow(hwnd) → TRUE if the handle is a valid window. Apps cache hwnds
+  // and check IsWindow before SendMessage to avoid touching destroyed windows
+  // (e.g. MFC's CFrameWnd::OnContextMenu uses this); a blanket 1 makes apps
+  // send to dangling handles, which we then silently ignore — but better to
+  // tell them upfront that the window is gone.
+  user32.register('IsWindow', 1, () => {
+    const hwnd = emu.readArg(0);
+    if (!hwnd) return 0;
+    return emu.handles.getType(hwnd) === 'window' ? 1 : 0;
+  });
+  user32.register('IsWindowVisible', 1, () => {
+    const hwnd = emu.readArg(0);
+    const wnd = emu.handles.get<WindowInfo>(hwnd);
+    return wnd && wnd.visible ? 1 : 0;
+  });
   user32.register('IsWindowEnabled', 1, () => {
     const hwnd = emu.readArg(0);
     const wnd = emu.handles.get<WindowInfo>(hwnd);
@@ -650,8 +748,7 @@ export function registerCreateWindow(emu: Emulator): void {
   });
   user32.register('EnumThreadWindows', 3, () => 1);
   user32.register('WindowFromPoint', 2, () => 0);
-  user32.register('FindWindowW', 2, () => 0); // not found
-  user32.register('FindWindowExW', 4, () => 0); // not found
+  // FindWindowW/FindWindowExW are registered in misc.ts with real implementations.
   user32.register('ChildWindowFromPoint', 3, () => {
     const hwnd = emu.readArg(0);
     const x = emu.readArg(1);

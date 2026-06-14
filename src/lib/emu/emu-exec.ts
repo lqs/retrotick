@@ -203,6 +203,16 @@ function callStdcall(emu: Emulator, addr: number, args: number[]): number | unde
 
   const targetDepth = emu.wndProcDepth - 1;
   let steps = 0;
+  // Time-based yield so a long-running wndProc (heavy WM_PAINT, OnTimer iterating
+  // a canvas, etc.) doesn't lock the JS thread for hundreds of milliseconds.
+  // Only safe when the caller knows how to propagate `undefined` and resume the
+  // wndProc later — currently DispatchMessageA, which sets emu._allowWndProcYield
+  // around its emu.callWndProc call. Init-time handlers like CreateWindowExA need
+  // synchronous completion to chain WM_NCCREATE → WM_NCCALCSIZE → WM_CREATE, so
+  // yields are off by default.
+  const canYield = (targetDepth === 0) && emu._allowWndProcYield;
+  const YIELD_MS = 16;
+  const startTime = canYield ? performance.now() : 0;
   // Tight loop detection: three consecutive-match samplers at different periods.
   // P=256 catches loops of length 1,2,4,8,16... (powers of 2).
   // P=252 catches loops of length 1,2,3,4,6,7,9,12,14... (highly composite).
@@ -211,6 +221,12 @@ function callStdcall(emu: Emulator, addr: number, args: number[]): number | unde
   let csEipB = 0, csHitB = 0, csNextB = 252;  // period 252
   let csEipC = 0, csHitC = 0;  // period 64
   while (emu.wndProcDepth > targetDepth && !emu.halted && !emu.cpu.halted) {
+    // Periodic time check — yield to the browser if we've been busy too long
+    if (canYield && (steps & 0xFFF) === 0 && steps > 0 && performance.now() - startTime > YIELD_MS) {
+      if (!emu._wndProcFrames.includes(frame)) emu._wndProcFrames.push(frame);
+      emu._wndProcSetupPending = true;
+      return undefined;
+    }
     const eip = emu.cpu.eip >>> 0;
 
     // Fast path: check loop cache every 64 steps

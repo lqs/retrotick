@@ -1091,7 +1091,32 @@ export function registerFile(emu: Emulator): void {
   kernel32.register('GetDriveTypeW', 1, () => getDriveType(true));
   kernel32.register('GetDriveTypeA', 1, () => getDriveType(false));
   kernel32.register('GetLogicalDrives', 0, () => 0x0200000C);
-  kernel32.register('GetFileAttributesExW', 3, () => 0);
+  // GetFileAttributesEx fills a WIN32_FILE_ATTRIBUTE_DATA struct (36 bytes):
+  //   DWORD attributes; FILETIME create, access, write; DWORD sizeHi, sizeLo.
+  // Stub→0 made installers and CRT stat()s misreport "file missing" even
+  // when GetFileAttributesA would return a valid value for the same path.
+  const getFileAttrsEx = (wide: boolean) => (): number => {
+    const lpFileName = emu.readArg(0);
+    const _level = emu.readArg(1);
+    const lpInfo = emu.readArg(2);
+    if (!lpFileName || !lpInfo) return 0;
+    const name = wide ? emu.memory.readUTF16String(lpFileName) : emu.memory.readCString(lpFileName);
+    const attrs = fs.getFileAttributes(name, emu.additionalFiles);
+    if (attrs === INVALID_HANDLE_VALUE) return 0;
+    emu.memory.writeU32(lpInfo,      attrs);
+    // FILETIMEs — we don't track them; zero is OK (callers usually only check
+    // attributes for existence and FILE_ATTRIBUTE_DIRECTORY).
+    emu.memory.writeU32(lpInfo + 4,  0); emu.memory.writeU32(lpInfo + 8,  0);
+    emu.memory.writeU32(lpInfo + 12, 0); emu.memory.writeU32(lpInfo + 16, 0);
+    emu.memory.writeU32(lpInfo + 20, 0); emu.memory.writeU32(lpInfo + 24, 0);
+    // File size — directories are 0; for files we don't have a cheap way to
+    // peek size without opening, so zero is the safest fallback.
+    emu.memory.writeU32(lpInfo + 28, 0);
+    emu.memory.writeU32(lpInfo + 32, 0);
+    return 1;
+  };
+  kernel32.register('GetFileAttributesExA', 3, getFileAttrsEx(false));
+  kernel32.register('GetFileAttributesExW', 3, getFileAttrsEx(true));
 
   kernel32.register('GetDiskFreeSpaceW', 5, () => {
     const _lpRootPathName = emu.readArg(0);
@@ -1303,8 +1328,35 @@ export function registerFile(emu: Emulator): void {
 
   kernel32.register('OpenFileMappingA', 3, () => 0);
 
-  // SetFilePointerEx(hFile, liDistanceToMove_lo, liDistanceToMove_hi, lpNewFilePointer, dwMoveMethod) — 5 args
-  kernel32.register('SetFilePointerEx', 5, () => 0);
+  // SetFilePointerEx(hFile, liDistanceToMove_lo, liDistanceToMove_hi,
+  //                   lpNewFilePointer, dwMoveMethod) — the 64-bit variant
+  // of SetFilePointer. Was a stub returning 0 (fail), so any app built for
+  // large-file support saw "seek failed" and refused to read past 2 GB —
+  // and modern CRT/MFC apps prefer Ex even for tiny files.
+  kernel32.register('SetFilePointerEx', 5, () => {
+    const hFile = emu.readArg(0);
+    const distLo = emu.readArg(1) | 0;
+    const distHi = emu.readArg(2) | 0;
+    const lpNewFP = emu.readArg(3);
+    const dwMoveMethod = emu.readArg(4);
+    const file = emu.handles.get<OpenFile>(hFile);
+    if (!file) return 0;
+    // Combine 64-bit signed offset (we cap at JS safe int range — files
+    // here never approach 2 PB).
+    const dist = distLo + distHi * 0x100000000;
+    let newPos: number;
+    if (dwMoveMethod === FILE_BEGIN)        newPos = dist;
+    else if (dwMoveMethod === FILE_CURRENT) newPos = file.pos + dist;
+    else if (dwMoveMethod === FILE_END)     newPos = file.size + dist;
+    else return 0;
+    if (newPos < 0) return 0; // seek before start is an error per docs
+    file.pos = newPos;
+    if (lpNewFP) {
+      emu.memory.writeU32(lpNewFP,     newPos >>> 0);
+      emu.memory.writeU32(lpNewFP + 4, Math.floor(newPos / 0x100000000) >>> 0);
+    }
+    return 1; // TRUE
+  });
 
   // FindFirstFileExA(lpFileName, fInfoLevelId, lpFindFileData, fSearchOp, lpSearchFilter, dwAdditionalFlags) — 6 args
   kernel32.register('FindFirstFileExA', 6, () => 0xFFFFFFFF); // INVALID_HANDLE_VALUE

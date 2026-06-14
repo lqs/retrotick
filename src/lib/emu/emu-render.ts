@@ -217,7 +217,7 @@ export function renderChildControls(emu: Emulator, hwnd: number): void {
     }
   }
 
-  for (const { hwnd: childHwnd, info: child } of allChildren) {
+  for (const { hwnd: childHwnd, info: child, ox, oy } of allChildren) {
     const controlId = child.controlId ?? 0;
     const className = child.classInfo.className.toUpperCase();
     const bsType = child.style & 0xF;
@@ -246,10 +246,36 @@ export function renderChildControls(emu: Emulator, hwnd: number): void {
       }
       if (emu.isNE) {
         emu.callWndProc16(child.wndProc, childHwnd, 0x000F, 0, 0); // WM_PAINT (Win16 PASCAL)
+        child.needsPaint = false;
       } else {
         emu.callWndProc(child.wndProc, childHwnd, 0x000F, 0, 0); // WM_PAINT (Win32 stdcall)
+        // Leave needsPaint set, and request an erase, so the message loop also
+        // delivers a REAL WM_ERASEBKGND + WM_PAINT via synthesizePaint. MFC
+        // routes these to OnEraseBkgnd/OnDraw only through a genuine
+        // GetMessage→DispatchMessage cycle; the forced call above is a no-op for
+        // deeply-nested MFC views (e.g. a docked CScrollView preview pane), so
+        // without the real delivery they never paint their background. The erase
+        // is where MFC views fill their background (the preview's black). This
+        // only runs on the parent frame's paint cycles (rare), not on the
+        // editor's per-cell caret-blink repaints, so it does not reintroduce the
+        // blink-timer repaint storm. BeginPaint clears needsPaint → exactly one
+        // real paint per frame-paint cycle (no storm).
+        child.needsErase = true;
       }
-      child.needsPaint = false;
+    }
+    // Built-in ToolbarWindow32 paint must run AFTER any MFC subclass WM_PAINT
+    // so our button bitmaps overlay MFC's stock chrome (gripper + grey base).
+    // PabloDraw subclasses the toolbar (wndProc != 0), and MFC's paint clears
+    // the bar before our canvas can stamp button glyphs; flipping the order
+    // means we paint last and stay visible.
+    if (className === 'TOOLBARWINDOW32') {
+      // Pop any save() left dangling by MFC's WM_PAINT (clip/transform stacks)
+      // so the drawImage region lands at the toolbar's world rect, not inside
+      // some leftover scroll clip.
+      if (emu.canvasCtx) {
+        for (let i = 0; i < 20; i++) emu.canvasCtx.restore();
+      }
+      renderToolbar(emu, ctx, child, ox, oy);
     }
   }
 }
@@ -325,4 +351,106 @@ function renderControl(emu: Emulator, ctx: CanvasRenderingContext2D, child: Wind
       renderEdit(ctx, child);
       break;
   }
+}
+
+/** Paint a CToolBar / ToolbarWindow32 with the standard Win9x flat layout.
+ *  Bitmap source comes from TB_ADDBITMAP (LoadToolBar passes the HBITMAP we
+ *  cached on the WindowInfo). Each button cell is bmpW x bmpH from the sheet,
+ *  centered in a buttonW x buttonH cell, separators get a fixed narrow gap.
+ *  Pressed/checked/disabled state isn't honoured yet — read fsState if you
+ *  add hover/press feedback later.
+ */
+function renderToolbar(emu: Emulator, ctx: CanvasRenderingContext2D, tb: WindowInfo, ox: number, oy: number): void {
+  const buttons = tb.tbButtons;
+  if (!buttons || buttons.length === 0) return;
+
+  // TBSTATE_HIDDEN = 0x08
+  const TBSTATE_HIDDEN = 0x08;
+  const TBSTATE_PRESSED = 0x02;
+  const TBSTATE_CHECKED = 0x01;
+  const TBSTATE_ENABLED = 0x04;
+  // TBSTYLE_SEP = 0x01
+  const TBSTYLE_SEP = 0x01;
+
+  // Bitmap size (cx, cy packed in tbBitmapSize via MAKELONG(cx, cy))
+  let bmpW = 16, bmpH = 15;
+  if (tb.tbBitmapSize !== undefined) {
+    bmpW = tb.tbBitmapSize & 0xFFFF;
+    bmpH = (tb.tbBitmapSize >>> 16) & 0xFFFF;
+  }
+  // Button size — defaults to bmpW+7 / bmpH+7 if not set (Win32 docs)
+  let btnW = bmpW + 7, btnH = bmpH + 7;
+  if (tb.tbButtonSize !== undefined) {
+    btnW = tb.tbButtonSize & 0xFFFF;
+    btnH = (tb.tbButtonSize >>> 16) & 0xFFFF;
+  }
+
+  // Resolve the bitmap from the cached handle.
+  // MFC's CToolBar::AddReplaceBitmap copies the resource bitmap into a
+  // CreateCompatibleBitmap via BitBlt — and our compat-canvas often ends up
+  // visually empty in the browser. BitBlt SRCCOPY now propagates resourceId
+  // from the source DC to the destination bitmap, so we can fall back to a
+  // direct resource reload (which carries the original imageData/canvas).
+  type ToolbarBmp = { width: number; height: number; canvas: OffscreenCanvas | HTMLCanvasElement; resourceId?: number; resourceModule?: number };
+  let bmp: ToolbarBmp | null = tb.tbBitmapHandle ? emu.handles.get<ToolbarBmp>(tb.tbBitmapHandle) : null;
+  if (bmp && bmp.resourceId !== undefined) {
+    const fallbackHandle = bmp.resourceModule
+      ? emu.loadBitmapResourceFromModule(bmp.resourceModule, bmp.resourceId)
+      : emu.loadBitmapResource(bmp.resourceId);
+    if (fallbackHandle) {
+      const direct = emu.handles.get<ToolbarBmp>(fallbackHandle);
+      if (direct && direct.canvas) bmp = direct;
+    }
+  }
+
+  const baseX = tb.x + ox;
+  const baseY = tb.y + oy;
+  let cursorX = baseX + 2;       // small left inset matches CCS_TOP layout
+  const cursorY = baseY + 2;
+
+  ctx.save();
+  // Toolbar background (Win9x dialog face)
+  ctx.fillStyle = '#d4d0c8';
+  ctx.fillRect(baseX, baseY, tb.width, tb.height);
+
+  for (const b of buttons) {
+    if (b.fsState & TBSTATE_HIDDEN) continue;
+    if (b.fsStyle & TBSTYLE_SEP) {
+      cursorX += b.iBitmap > 0 ? b.iBitmap : 6; // separator width (iBitmap doubles as cx for SEP)
+      continue;
+    }
+    const cellX = cursorX;
+    const cellY = cursorY;
+    // Pressed / checked frames
+    const pressed = !!(b.fsState & TBSTATE_PRESSED);
+    const checked = !!(b.fsState & TBSTATE_CHECKED);
+    if (pressed || checked) {
+      ctx.fillStyle = checked && !pressed ? '#dfdcd6' : '#bdbab5';
+      ctx.fillRect(cellX, cellY, btnW, btnH);
+      // Sunken edge
+      ctx.strokeStyle = '#808080';
+      ctx.beginPath();
+      ctx.moveTo(cellX + 0.5, cellY + btnH - 0.5);
+      ctx.lineTo(cellX + 0.5, cellY + 0.5);
+      ctx.lineTo(cellX + btnW - 0.5, cellY + 0.5);
+      ctx.stroke();
+    }
+    // Bitmap glyph
+    if (bmp?.canvas) {
+      const enabled = !!(b.fsState & TBSTATE_ENABLED);
+      const sx = b.iBitmap * bmpW;
+      const dx = cellX + Math.floor((btnW - bmpW) / 2);
+      const dy = cellY + Math.floor((btnH - bmpH) / 2);
+      if (!enabled) ctx.globalAlpha = 0.45;
+      // OffscreenCanvas works as drawImage source in modern browsers
+      ctx.drawImage(bmp.canvas as CanvasImageSource, sx, 0, bmpW, bmpH, dx, dy, bmpW, bmpH);
+      if (!enabled) ctx.globalAlpha = 1;
+    } else {
+      // No bitmap loaded yet — outline placeholder so the user sees buttons exist
+      ctx.strokeStyle = '#808080';
+      ctx.strokeRect(cellX + 0.5, cellY + 0.5, btnW - 1, btnH - 1);
+    }
+    cursorX += btnW;
+  }
+  ctx.restore();
 }

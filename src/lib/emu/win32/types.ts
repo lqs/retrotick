@@ -18,7 +18,10 @@ export const WM_ERASEBKGND = 0x0014;
 export const WM_SHOWWINDOW = 0x0018;
 export const WM_ACTIVATEAPP = 0x001C;
 export const WM_SETCURSOR = 0x0020;
+export const WM_MOUSEACTIVATE = 0x0021;
 export const WM_GETMINMAXINFO = 0x0024;
+/** WM_MOUSEACTIVATE result: activate and pass the click through */
+export const MA_ACTIVATE = 1;
 export const WM_DRAWITEM = 0x002B;
 export const WM_WINDOWPOSCHANGING = 0x0046;
 export const WM_WINDOWPOSCHANGED = 0x0047;
@@ -216,6 +219,12 @@ export const SM_CYVIRTUALSCREEN = 79;
 // Background modes
 export const TRANSPARENT = 1;
 export const OPAQUE = 2;
+
+// Region complexity return values (clip functions)
+export const RGN_ERROR = 0;
+export const NULLREGION = 1;
+export const SIMPLEREGION = 2;
+export const COMPLEXREGION = 3;
 
 // MK flags for mouse messages
 export const MK_LBUTTON = 0x0001;

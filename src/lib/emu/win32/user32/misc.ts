@@ -1,6 +1,6 @@
 import type { Emulator } from '../../emulator';
 import type { WindowInfo } from './types';
-import { getClientSize, clampToMinTrackSize } from './_helpers';
+import { getClientSize, clientSizeOf, computeNcInset, clampToMinTrackSize, invalidateForResize } from './_helpers';
 import { emuCompleteThunk } from '../../emu-exec';
 import { launchHelpFile } from '../../help-launcher';
 import {
@@ -22,6 +22,9 @@ export function registerMisc(emu: Emulator): void {
 
   // DragObject(hwndParent, hwndFrom, wFmt, dwData, hcur) — 5 args
   user32.register('DragObject', 5, () => 0);
+
+  // NotifyWinEvent(event, hwnd, idObject, idChild) — accessibility notification, no-op
+  user32.register('NotifyWinEvent', 4, () => 0);
 
   // System metrics
   user32.register('GetSystemMetrics', 1, () => {
@@ -110,10 +113,12 @@ export function registerMisc(emu: Emulator): void {
   const WS_CHILD = 0x40000000;
   const clientOrigin = (wnd: WindowInfo | null): { x: number; y: number } => {
     if (!wnd) return { x: 0, y: 0 }; // desktop/screen
+    // A custom WM_NCCALCSIZE margin insets the client origin within the window
+    const il = wnd.ncInset?.l ?? 0, it = wnd.ncInset?.t ?? 0;
     if (wnd.style & WS_CHILD) {
       const parentWnd = wnd.parent ? emu.handles.get<WindowInfo>(wnd.parent) : null;
       const parentOrigin = clientOrigin(parentWnd);
-      return { x: parentOrigin.x + wnd.x, y: parentOrigin.y + wnd.y };
+      return { x: parentOrigin.x + wnd.x + il, y: parentOrigin.y + wnd.y + it };
     }
     // Top-level window: account for border and caption
     const { cw, ch } = getClientSize(wnd.style, wnd.hMenu !== 0, wnd.width, wnd.height);
@@ -301,12 +306,14 @@ export function registerMisc(emu: Emulator): void {
           wnd.width = clamped.w; wnd.height = clamped.h;
         }
         if (sizeChanged && wnd.wndProc) {
-          const { cw, ch } = getClientSize(wnd.style, wnd.hMenu !== 0, wnd.width, wnd.height);
-          const lParam = ((ch & 0xFFFF) << 16) | (cw & 0xFFFF);
+          computeNcInset(emu, e.hWnd, wnd);
+          const cs = clientSizeOf(wnd);
+          const lParam = ((cs.ch & 0xFFFF) << 16) | (cs.cw & 0xFFFF);
           emu.callWndProc(wnd.wndProc, e.hWnd, 0x0005, 0, lParam); // WM_SIZE
         }
-        wnd.needsPaint = true;
-        wnd.needsErase = true;
+        // Invalidate the full new client so a stale partial invalidRect captured
+        // at the previous size can't leave part of the client unpainted.
+        invalidateForResize(emu, wnd);
       }
       // Fix up MFC dock bars that have 0 size but visible children.
       // MFC's CDockBar::OnSizeParent may fail to claim space if its internal
@@ -392,6 +399,87 @@ export function registerMisc(emu: Emulator): void {
         }
       }
 
+      // Reserve a bottom status bar's height. MFC's RepositionBars sometimes
+      // lays out the bottom dock bar and the side docks/view against the full
+      // client height without subtracting a bottom status bar, so they extend
+      // underneath it (the palette/F-keys end up partly hidden by the status
+      // bar). Pull the bottom dock up to rest on the status bar, then clamp the
+      // side docks / view to sit above it. Do this BEFORE the vertical-fill pass
+      // so a filled side pane uses the corrected (shorter) dock height.
+      {
+        const mainW = emu.handles.get<WindowInfo>(emu.mainWindow);
+        if (mainW?.childList) {
+          let statusTop = Infinity, statusHwnd = 0;
+          for (const ch of mainW.childList) {
+            const c = emu.handles.get<WindowInfo>(ch);
+            if (c?.visible && (c.classInfo?.className ?? '').toUpperCase() === 'MSCTLS_STATUSBAR32' && c.y < statusTop) {
+              statusTop = c.y; statusHwnd = ch;
+            }
+          }
+          if (statusHwnd && statusTop < Infinity) {
+            let limit = statusTop;
+            // Move the bottom dock up so it ends exactly at the status bar top.
+            for (const ch of mainW.childList) {
+              const c = emu.handles.get<WindowInfo>(ch);
+              if (!c || !c.visible || (c.controlId ?? 0) !== AFX_IDW_DOCKBAR_BOTTOM) continue;
+              if (c.y + c.height > statusTop) {
+                c.y = statusTop - c.height;
+                c.needsPaint = true; c.needsErase = true;
+                for (const cc of c.childList ?? []) {
+                  const w = emu.handles.get<WindowInfo>(cc);
+                  if (w) { w.needsPaint = true; w.needsErase = true; }
+                }
+              }
+              if (c.y < limit) limit = c.y;
+            }
+            // Clamp anything else that still reaches below the bottom dock top
+            // (the view and the left/right side docks).
+            for (const ch of mainW.childList) {
+              if (ch === statusHwnd) continue;
+              const c = emu.handles.get<WindowInfo>(ch);
+              if (!c || !c.visible || (c.controlId ?? 0) === AFX_IDW_DOCKBAR_BOTTOM) continue;
+              if (c.y < limit && c.y + c.height > limit) {
+                c.height = limit - c.y;
+                if (c.wndProc) computeNcInset(emu, ch, c);
+                const cs = clientSizeOf(c);
+                if (c.wndProc) {
+                  emu.callWndProc(c.wndProc, ch, 0x0005, 0, ((cs.ch & 0xFFFF) << 16) | (cs.cw & 0xFFFF)); // WM_SIZE
+                }
+                invalidateForResize(emu, c);
+              }
+            }
+          }
+        }
+      }
+
+      // Stretch a sole "sizing" control bar to fill the HEIGHT of a left/right
+      // dock bar (a docked preview/properties pane fills the whole side it's
+      // docked to). Only LEFT/RIGHT (vertical) docks: a bar in a top/bottom
+      // dock keeps its content width and sits side-by-side with others, so
+      // stretching its width would wrongly make it span the whole edge.
+      // Toolbars/status bars are excluded (they size to content). Only act when
+      // the dock holds a single fillable child.
+      const NON_FILL = new Set(['TOOLBARWINDOW32', 'MSCTLS_STATUSBAR32', 'REBARWINDOW32']);
+      for (const e of dwp.entries) {
+        const dock = emu.handles.get<WindowInfo>(e.hWnd);
+        if (!dock || !dock.childList) continue;
+        const ctrlId = dock.controlId ?? 0;
+        if (ctrlId !== AFX_IDW_DOCKBAR_LEFT && ctrlId !== AFX_IDW_DOCKBAR_RIGHT) continue;
+        const fillable = dock.childList
+          .map((h) => [h, emu.handles.get<WindowInfo>(h)] as const)
+          .filter(([, c]) => !!c && c.visible && !NON_FILL.has((c.classInfo?.className ?? '').toUpperCase()));
+        if (fillable.length !== 1) continue;
+        const [chwnd, child] = fillable[0];
+        if (!child || dock.height <= child.height) continue; // already fills
+        child.height = dock.height;
+        if (child.wndProc) computeNcInset(emu, chwnd, child);
+        const cs = clientSizeOf(child);
+        if (child.wndProc) {
+          emu.callWndProc(child.wndProc, chwnd, 0x0005, 0, ((cs.ch & 0xFFFF) << 16) | (cs.cw & 0xFFFF)); // WM_SIZE
+        }
+        invalidateForResize(emu, child);
+      }
+
       // Also mark main window for repaint
       const mainWnd = emu.handles.get<WindowInfo>(emu.mainWindow);
       if (mainWnd) {
@@ -431,8 +519,54 @@ export function registerMisc(emu: Emulator): void {
     return 0;
   });
 
-  user32.register('FindWindowA', 2, () => 0); // not found
-  user32.register('FindWindowExA', 4, () => 0); // not found
+  // FindWindow(class, title) → HWND of top-level window matching both names
+  // (NULL on either means "any"). Single-instance apps call this on startup
+  // to detect a running peer; if we always return 0 they can't reuse that
+  // peer's window (mostly harmless), but apps that talk to the shell taskbar
+  // or system tray via FindWindow get a stub-0 and silently skip the call.
+  const findWindowImpl = (wide: boolean) => (): number => {
+    const classPtr = emu.readArg(0);
+    const titlePtr = emu.readArg(1);
+    const wantClass = !classPtr ? null
+      : classPtr < 0x10000 ? `#${classPtr}` // atom
+      : (wide ? emu.memory.readUTF16String(classPtr) : emu.memory.readCString(classPtr));
+    const wantTitle = !titlePtr ? null
+      : (wide ? emu.memory.readUTF16String(titlePtr) : emu.memory.readCString(titlePtr));
+    for (const [hwnd, w] of emu.handles.findByType<WindowInfo>('window')) {
+      if (w.parent) continue; // top-level only
+      if (wantClass !== null && w.classInfo?.className !== wantClass) continue;
+      if (wantTitle !== null && (w.title ?? '') !== wantTitle) continue;
+      return hwnd;
+    }
+    return 0;
+  };
+  user32.register('FindWindowA', 2, findWindowImpl(false));
+  user32.register('FindWindowW', 2, findWindowImpl(true));
+
+  // FindWindowEx(parent, after, class, title) — same as FindWindow but scoped
+  // to children of `parent` (or desktop if NULL), starting search after `after`.
+  const findWindowExImpl = (wide: boolean) => (): number => {
+    const parent = emu.readArg(0);
+    const after = emu.readArg(1);
+    const classPtr = emu.readArg(2);
+    const titlePtr = emu.readArg(3);
+    const wantClass = !classPtr ? null
+      : classPtr < 0x10000 ? `#${classPtr}`
+      : (wide ? emu.memory.readUTF16String(classPtr) : emu.memory.readCString(classPtr));
+    const wantTitle = !titlePtr ? null
+      : (wide ? emu.memory.readUTF16String(titlePtr) : emu.memory.readCString(titlePtr));
+    let started = !after;
+    for (const [hwnd, w] of emu.handles.findByType<WindowInfo>('window')) {
+      if (!started) { if (hwnd === after) started = true; continue; }
+      if (parent ? w.parent !== parent : !!w.parent) continue;
+      if (wantClass !== null && w.classInfo?.className !== wantClass) continue;
+      if (wantTitle !== null && (w.title ?? '') !== wantTitle) continue;
+      return hwnd;
+    }
+    return 0;
+  };
+  user32.register('FindWindowExA', 4, findWindowExImpl(false));
+  user32.register('FindWindowExW', 4, findWindowExImpl(true));
   // Common resolutions reported at 16bpp and 32bpp, 60Hz. Windows reports
   // many modes; the demo's config dialog filters to >8bpp and picks 640x480.
   const COMMON_MODES: [number, number][] = [
@@ -521,12 +655,51 @@ export function registerMisc(emu: Emulator): void {
   });
 
   user32.register('LockWindowUpdate', 1, () => 1);
-  user32.register('SetCursorPos', 2, () => 1);
+  // SetCursorPos(x, y) — we can't actually move the host OS cursor from inside
+  // a browser, but we cache the position so subsequent GetCursorPos calls see
+  // the requested coordinates (matches how DOOM-style games warp the mouse).
+  user32.register('SetCursorPos', 2, () => {
+    emu.cursorX = emu.readArg(0) | 0;
+    emu.cursorY = emu.readArg(1) | 0;
+    return 1;
+  });
   user32.register('ClipCursor', 1, () => 1);
-  user32.register('WindowFromDC', 1, () => 0);
+  // WindowFromDC(hdc) → HWND owning the device context (or 0 for memory DCs).
+  // DCInfo carries hwnd already; the stub-0 made some MFC code reach a custom
+  // wndProc with a NULL hwnd and skip the paint.
+  user32.register('WindowFromDC', 1, () => {
+    const hdc = emu.readArg(0);
+    const dc = emu.getDC(hdc);
+    return dc?.hwnd ?? 0;
+  });
   user32.register('CountClipboardFormats', 0, () => 0);
   user32.register('SetWindowContextHelpId', 2, () => 1);
-  user32.register('EnumChildWindows', 3, () => 1);
+  // EnumChildWindows(hWndParent, lpEnumFunc, lParam) — call lpEnumFunc(child,
+  // lParam) for each immediate child of hWndParent (or every top-level window
+  // if hWndParent is NULL). Stop if the callback returns FALSE. Apps use this
+  // to iterate dialog controls, gather toolbar children, etc.
+  user32.register('EnumChildWindows', 3, () => {
+    const hParent = emu.readArg(0);
+    const callback = emu.readArg(1);
+    const lParam = emu.readArg(2);
+    if (!callback) return 0;
+    // Build the list before invoking the callback so wndProcs that modify the
+    // window tree (rare but legal) don't trip the iteration.
+    const targets: number[] = [];
+    if (hParent) {
+      const parent = emu.handles.get<WindowInfo>(hParent);
+      if (parent?.childList) targets.push(...parent.childList);
+    } else {
+      for (const [hwnd, w] of emu.handles.findByType<WindowInfo>('window')) {
+        if (!w.parent) targets.push(hwnd);
+      }
+    }
+    for (const hwnd of targets) {
+      const ret = emu.callWndProc(callback, hwnd, lParam, 0, 0);
+      if (ret === 0) break;
+    }
+    return 1;
+  });
 
   user32.register('SendMessageTimeoutA', 6, () => {
     // Simplified: just call SendMessageA logic — return 1 (success)
@@ -658,11 +831,6 @@ export function registerMisc(emu: Emulator): void {
 
   // AllowSetForegroundWindow(dwProcessId) → BOOL
   user32.register('AllowSetForegroundWindow', 1, () => 1);
-
-  // CreateAcceleratorTableW: return a fake handle
-  user32.register('CreateAcceleratorTableW', 2, () => {
-    return emu.handles.alloc('accel', {});
-  });
 
   // RegisterHotKey: return TRUE (success)
   user32.register('RegisterHotKey', 4, () => 1);

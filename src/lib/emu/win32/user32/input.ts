@@ -7,7 +7,6 @@ export function registerInput(emu: Emulator): void {
   // Mouse capture
   user32.register('SetCapture', 1, () => {
     const hwnd = emu.readArg(0);
-    console.log(`[SetCapture] hwnd=0x${hwnd.toString(16)}`);
     emu.capturedWindow = hwnd;
     return 0;
   });
@@ -23,8 +22,9 @@ export function registerInput(emu: Emulator): void {
 
   user32.register('GetCursorPos', 1, () => {
     const ptr = emu.readArg(0);
-    emu.memory.writeU32(ptr, 0);
-    emu.memory.writeU32(ptr + 4, 0);
+    if (!ptr) return 0;
+    emu.memory.writeI32(ptr,     emu.cursorX | 0);
+    emu.memory.writeI32(ptr + 4, emu.cursorY | 0);
     return 1;
   });
 
@@ -48,7 +48,8 @@ export function registerInput(emu: Emulator): void {
   user32.register('ShowCursor', 1, () => 1);
   user32.register('GetKeyState', 1, () => {
     const vk = emu.readArg(0) & 0xFF;
-    return emu.keyStates.has(vk) ? 0x8000 : 0;
+    // Bit 15: key down; bit 0: toggle state (CAPS/NUM/SCROLL lock)
+    return (emu.keyStates.has(vk) ? 0x8000 : 0) | (emu.keyToggles.has(vk) ? 1 : 0);
   });
   user32.register('GetAsyncKeyState', 1, () => {
     const vk = emu.readArg(0) & 0xFF;
@@ -58,7 +59,7 @@ export function registerInput(emu: Emulator): void {
   user32.register('GetKeyboardState', 1, () => {
     const ptr = emu.readArg(0);
     for (let i = 0; i < 256; i++) {
-      emu.memory.writeU8(ptr + i, emu.keyStates.has(i) ? 0x80 : 0);
+      emu.memory.writeU8(ptr + i, (emu.keyStates.has(i) ? 0x80 : 0) | (emu.keyToggles.has(i) ? 1 : 0));
     }
     return 1;
   });

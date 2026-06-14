@@ -54,6 +54,8 @@ export function registerSelect(emu: Emulator): void {
           }
         }
         dc.selectedBitmap = hObj;
+        dc.selectedBitmapResId = bmp.resourceId;
+        dc.selectedBitmapResModule = bmp.resourceModule;
         dc.canvas.width = bmp.width;
         dc.canvas.height = bmp.height;
         // Draw the bitmap content onto the DC

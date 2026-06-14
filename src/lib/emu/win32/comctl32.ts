@@ -11,6 +11,23 @@ export function registerComctl32(emu: Emulator): void {
   comctl32.register('InitCommonControlsEx', 1, () => 1);
   comctl32.register('InitCommonControls', 0, () => 0);
 
+  // DllGetVersion(DLLVERSIONINFO* pdvi) — fills version info, returns S_OK.
+  // MFC and many apps call this to detect which COMCTL32 features are available.
+  // We report 6.0 (matching Windows XP+ visual styles era), which enables modern
+  // common control APIs without requiring a manifest.
+  comctl32.register('DllGetVersion', 1, () => {
+    const pdvi = emu.readArg(0);
+    if (!pdvi) return 0x80004003; // E_POINTER
+    // DLLVERSIONINFO size at [0] tells us which version of the struct caller passed.
+    // Both v1 (size=20) and v2 (size=32) start with cbSize, dwMajorVersion, dwMinorVersion,
+    // dwBuildNumber, dwPlatformID; v2 adds dwFlags + szTimeStamp[16].
+    emu.memory.writeU32(pdvi + 4, 6);    // dwMajorVersion = 6
+    emu.memory.writeU32(pdvi + 8, 0);    // dwMinorVersion = 0
+    emu.memory.writeU32(pdvi + 12, 6000); // dwBuildNumber
+    emu.memory.writeU32(pdvi + 16, 1);   // dwPlatformID = DLLVER_PLATFORM_WINDOWS
+    return 0; // S_OK
+  });
+
   // ImageList_LoadImageW(hI, lpbmp, cx, cGrow, crMask, uType, uFlags) — return NULL (not supported)
   comctl32.register('ImageList_LoadImageW', 7, () => 0);
 

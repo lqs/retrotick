@@ -255,6 +255,25 @@ export function registerComdlg32(emu: Emulator): void {
     return findDlgHwnd;
   });
   comdlg32.register('PrintDlgExW', 1, () => 1); // E_FAIL
+  // BOOL PrintDlgA(LPPRINTDLGA lppd) — return FALSE (user cancelled)
+  comdlg32.register('PrintDlgA', 1, () => 0);
+  comdlg32.register('PrintDlgW', 1, () => 0);
+  comdlg32.register('GetFileTitleA', 3, () => {
+    const lpszFile = emu.readArg(0);
+    const lpszTitle = emu.readArg(1);
+    const cchSize = emu.readArg(2);
+    if (!lpszFile) return -1;
+    const fullPath = emu.memory.readCString(lpszFile);
+    const lastSep = Math.max(fullPath.lastIndexOf('\\'), fullPath.lastIndexOf('/'));
+    const title = lastSep >= 0 ? fullPath.substring(lastSep + 1) : fullPath;
+    if (!lpszTitle || cchSize === 0) return title.length + 1;
+    const toWrite = title.substring(0, cchSize - 1);
+    for (let i = 0; i < toWrite.length; i++) {
+      emu.memory.writeU8(lpszTitle + i, toWrite.charCodeAt(i) & 0xFF);
+    }
+    emu.memory.writeU8(lpszTitle + toWrite.length, 0);
+    return 0;
+  });
   comdlg32.register('GetFileTitleW', 3, () => {
     const lpszFile = emu.readArg(0);
     const lpszTitle = emu.readArg(1);

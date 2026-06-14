@@ -122,8 +122,48 @@ export function registerWindowLong(emu: Emulator): void {
     return val;
   });
 
-  user32.register('SetClassLongA', 3, () => 0);
-  user32.register('SetClassLongW', 3, () => 0);
-  user32.register('GetClassLongW', 2, () => 0);
-  user32.register('GetClassLongA', 2, () => 0);
+  // GCL_* indices (negative) — selectors for class-level attributes.
+  // MFC's CWnd::GetIcon / CMainFrame::GetClassLong queries these; a 0 return
+  // makes the small-icon area in the title bar fall back to a default, and
+  // confuses scripts that read class style or wnd-extra size.
+  const getClassLong = (): number => {
+    const hwnd = emu.readArg(0);
+    const index = emu.readArg(1) | 0;
+    const wnd = emu.handles.get<WindowInfo>(hwnd);
+    const cls = wnd?.classInfo;
+    if (!cls) return 0;
+    if (index === -10) return cls.hbrBackground; // GCL_HBRBACKGROUND
+    if (index === -12) return cls.hCursor;       // GCL_HCURSOR
+    if (index === -14) return cls.hIcon;         // GCL_HICON
+    if (index === -34) return cls.hIcon;         // GCL_HICONSM — same icon
+    if (index === -16) return cls.hInstance;     // GCL_HMODULE
+    if (index === -18) return cls.cbWndExtra;    // GCL_CBWNDEXTRA
+    if (index === -20) return cls.cbClsExtra;    // GCL_CBCLSEXTRA
+    if (index === -24) return cls.wndProc;       // GCL_WNDPROC
+    if (index === -26) return cls.style;         // GCL_STYLE
+    if (index === -8)  return cls.menuName;      // GCL_MENUNAME
+    return 0;
+  };
+  user32.register('GetClassLongA', 2, getClassLong);
+  user32.register('GetClassLongW', 2, getClassLong);
+
+  const setClassLong = (): number => {
+    const hwnd = emu.readArg(0);
+    const index = emu.readArg(1) | 0;
+    const value = emu.readArg(2);
+    const wnd = emu.handles.get<WindowInfo>(hwnd);
+    const cls = wnd?.classInfo;
+    if (!cls) return 0;
+    let old = 0;
+    if (index === -10) { old = cls.hbrBackground; cls.hbrBackground = value; }
+    else if (index === -12) { old = cls.hCursor; cls.hCursor = value; }
+    else if (index === -14) { old = cls.hIcon; cls.hIcon = value; }
+    else if (index === -34) { old = cls.hIcon; cls.hIcon = value; }
+    else if (index === -16) { old = cls.hInstance; cls.hInstance = value; }
+    else if (index === -24) { old = cls.wndProc; cls.wndProc = value; }
+    else if (index === -26) { old = cls.style; cls.style = value; }
+    return old;
+  };
+  user32.register('SetClassLongA', 3, setClassLong);
+  user32.register('SetClassLongW', 3, setClassLong);
 }

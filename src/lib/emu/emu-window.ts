@@ -1,12 +1,17 @@
 import type { Emulator } from './emulator';
 import type { DCInfo, BitmapInfo, BrushInfo, PenInfo } from './win32/gdi32/index';
 import type { WindowInfo } from './win32/user32/index';
-import { OPAQUE, SYS_COLORS, COLOR_BTNFACE } from './win32/types';
+import { OPAQUE, SYS_COLORS, COLOR_BTNFACE, WM_NCPAINT } from './win32/types';
 import { decodeDib } from '../pe/decode-dib';
 import { rvaToFileOffset } from '../pe/read';
 import { renderChildControls } from './emu-render';
-import { getClientSize, getNonClientMetrics } from './win32/user32/_helpers';
+import { getClientSize, clientSizeOf, getNonClientMetrics } from './win32/user32/_helpers';
 import { emuFindResourceEntryForModule } from './emu-load';
+
+// WM_ERASEBKGND — dispatched from beginPaint so apps that override OnEraseBkgnd run.
+const WM_ERASEBKGND = 0x0014;
+// WM_SETFOCUS — delivered on main-window promotion (activation gives focus).
+const WM_SETFOCUS = 0x0007;
 
 // Track DCs that have canvas state saved (child window translate)
 const childDCSet = new Set<number>();
@@ -54,6 +59,16 @@ export function promoteToMainWindow(emu: Emulator, hwnd: number, wnd: WindowInfo
         emu.canvasCtx.fillRect(0, 0, cw, ch);
       }
     }
+  }
+
+  // Activation gives the new top-level window keyboard focus (real Windows
+  // sends WM_SETFOCUS as part of activating it). Deliver via the queue so the
+  // app handles it in its message loop — MFC's CFrameWnd::OnSetFocus then
+  // forwards focus to its active view via SetFocus, which records the real
+  // focus target (emu.focusedWindow) used to route keyboard input.
+  if (emu.focusedWindow !== hwnd) {
+    emu.focusedWindow = hwnd;
+    if (wnd.wndProc) emu.postMessage(hwnd, WM_SETFOCUS, 0, 0);
   }
 
   emu.onWindowChange?.(wnd);
@@ -114,17 +129,168 @@ function getWindowOrigin(emu: Emulator, hwnd: number): { x: number; y: number } 
     // Child windows are positioned relative to the parent's client area, so we need
     // to offset by the parent's non-client area (border + caption)
     if (parent && parent.hwnd !== emu.mainWindow) {
-      const { bw, captionH } = getNonClientMetrics(parent.style, !!parent.hMenu, emu.isNE);
-      x += bw;
-      y += bw + captionH;
+      if (parent.ncInset) {
+        // The parent reserved a custom non-client area via WM_NCCALCSIZE
+        // (e.g. a control bar's gripper/edges); its client origin is inset by it.
+        x += parent.ncInset.l;
+        y += parent.ncInset.t;
+      } else {
+        const { bw, captionH } = getNonClientMetrics(parent.style, !!parent.hMenu, emu.isNE);
+        x += bw;
+        y += bw + captionH;
+      }
     }
     cur = parent;
   }
   return { x, y };
 }
 
-export function getWindowDC(emu: Emulator, hwnd: number): number {
+/**
+ * Clip out the canvas rects of visible windows ABOVE this one in z-order
+ * (later siblings in each ancestor's childList) — the shared-canvas
+ * equivalent of Windows compositing. Without this, two overlapping sibling
+ * windows each repaint their full rect at independent times (caret blinks,
+ * partial invalidations) and the overlap pixels alternate between the two
+ * painters, which shows up as flicker along the boundary.
+ * Coordinates are local to the window: the caller has already set the DC
+ * transform so local (0,0) maps to canvas (origin.x, origin.y + ccsYOffset).
+ */
+function clipUpperSiblings(
+  emu: Emulator,
+  hwnd: number,
+  wnd: WindowInfo,
+  ctx: CanvasRenderingContext2D | OffscreenCanvasRenderingContext2D,
+  origin: { x: number; y: number },
+  ccsYOffset: number,
+): void {
+  const excl: { x: number; y: number; w: number; h: number }[] = [];
+  // A sibling's children may stick out of the sibling's own rect (e.g. MFC
+  // sizing control bars created at (-2,-2) inside their dock bar), so exclude
+  // the visible DESCENDANT rects too, not just the sibling rect itself.
+  const pushWithDescendants = (h: number, depth: number): void => {
+    const w = emu.handles.get<WindowInfo>(h);
+    if (!w || !w.visible || depth > 8) return;
+    if (w.width > 0 && w.height > 0) {
+      const o = getWindowOrigin(emu, h);
+      excl.push({ x: o.x, y: o.y, w: w.width, h: w.height });
+    }
+    if (w.childList) {
+      for (const ch of w.childList) pushWithDescendants(ch, depth + 1);
+    }
+  };
+  let cur = hwnd;
+  let guard = 0;
+  while (cur && cur !== emu.mainWindow && guard++ < 32) {
+    const w = emu.handles.get<WindowInfo>(cur);
+    if (!w || !w.parent) break;
+    const p = emu.handles.get<WindowInfo>(w.parent);
+    if (p?.childList) {
+      const idx = p.childList.indexOf(cur);
+      if (idx >= 0) {
+        for (let i = idx + 1; i < p.childList.length; i++) {
+          pushWithDescendants(p.childList[i], 0);
+        }
+      }
+    }
+    cur = w.parent;
+  }
+  if (excl.length === 0) return;
+  // Subtract each upper-window rect with its OWN evenodd clip (intersection of
+  // successive clips = window minus the UNION of the rects). A single evenodd
+  // path breaks when exclusion rects overlap each other — e.g. a dock pane and
+  // its same-sized inner view both excluded: the doubly-covered region flips
+  // even→odd→even and becomes paintable again, letting a lower window's
+  // scrollbar bleed through (the editor/preview boundary flicker).
+  const seen = new Set<string>();
+  for (const r of excl) {
+    const key = `${r.x},${r.y},${r.w},${r.h}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    const lx = r.x - origin.x;
+    const ly = r.y - origin.y - ccsYOffset;
+    ctx.beginPath();
+    ctx.rect(-1e7, -1e7, 2e7, 2e7);
+    ctx.rect(lx, ly, r.w, r.h);
+    ctx.clip('evenodd');
+  }
+}
+
+/**
+ * DC drawing area for a window: client-relative DCs of a window with a custom
+ * NC margin (ncInset) are offset to the client origin and sized to the client;
+ * everything else uses the window origin/size (client == window for plain
+ * children, and window-relative DCs always cover the full window).
+ */
+function dcArea(emu: Emulator, wnd: WindowInfo, origin: { x: number; y: number }, windowRelative: boolean) {
+  if (!windowRelative && wnd.ncInset) {
+    const { cw, ch } = clientSizeOf(wnd);
+    return { x: origin.x + wnd.ncInset.l, y: origin.y + wnd.ncInset.t, w: cw, h: ch };
+  }
+  return { x: origin.x, y: origin.y, w: wnd.width, h: wnd.height };
+}
+
+/**
+ * On real Windows, GetDC/BeginPaint DCs are CLIENT-relative; only GetWindowDC
+ * is window-relative. The two origins coincide except for windows whose own
+ * WM_NCCALCSIZE reserves a custom NC margin (wnd.ncInset) — for those, the
+ * client DC must be offset by the inset and clipped to the client area, or the
+ * app's client painting lands on (and erases) its own NC margin.
+ * `windowRelative` selects GetWindowDC semantics (origin at the window
+ * top-left, clip to the full window rect).
+ */
+export function getWindowDC(emu: Emulator, hwnd: number, windowRelative = false): number {
   const wnd = emu.handles.get<WindowInfo>(hwnd);
+
+  // Window-relative DC on the MAIN window. Its non-client band (caption +
+  // menu) is rendered by the DOM shell, not the canvas — the canvas covers
+  // the client area only. Real GetWindowDC has its origin at the WINDOW
+  // corner, so app drawing aimed at the NC band (e.g. FreeCell's
+  // "Cards Left" counter painted next to its menu) must NOT land on the
+  // client canvas shifted down by the NC height. When the UI provides an NC
+  // overlay canvas (positioned over the menu bar), draw there; otherwise use
+  // the main canvas with the window origin so NC-band coordinates clip out.
+  if (windowRelative && wnd && hwnd === emu.mainWindow && emu.canvasCtx) {
+    // The menu can come from the window (hMenu) or from the class
+    // (lpszMenuName) — both reserve an SM_CYMENU band in the NC area.
+    const hasMenu = !!wnd.hMenu || !!wnd.classInfo?.menuName;
+    const { bw, captionH, menuH } = getNonClientMetrics(wnd.style, hasMenu, emu.isNE);
+    let hdcNc = (emu as any)._ncWindowDC as number | undefined;
+    let dc = hdcNc ? emu.handles.get<DCInfo>(hdcNc) : null;
+    if (!dc) {
+      dc = {
+        canvas: emu.canvas!, ctx: emu.canvasCtx, hwnd,
+        selectedBitmap: 0,
+        selectedPen: emu.isNE ? 0x8007 : 0x80000007,    // BLACK_PEN
+        selectedBrush: emu.isNE ? 0x8000 : 0x80000000,  // WHITE_BRUSH
+        selectedFont: 0, selectedPalette: 0,
+        textColor: 0, bkColor: 0xFFFFFF, bkMode: OPAQUE,
+        penPosX: 0, penPosY: 0, rop2: 13,
+      };
+      hdcNc = emu.handles.alloc('dc', dc);
+      (emu as any)._ncWindowDC = hdcNc;
+    }
+    if (emu.ncCanvas) {
+      // Dedicated overlay canvas over the menu bar; its top-left is the
+      // window's (bw, bw+captionH). Own context → a plain transform, no
+      // save/clip arming needed (ReleaseDC's releaseChildDC is a no-op).
+      if (emu.ncCanvas.width !== wnd.width) emu.ncCanvas.width = wnd.width;
+      dc.canvas = emu.ncCanvas;
+      dc.ctx = emu.ncCanvas.getContext('2d')!;
+      dc.ctx.imageSmoothingEnabled = false;
+      dc.ctx.setTransform(1, 0, 0, 1, -bw, -(bw + captionH));
+    } else {
+      // Shared client canvas: arm save+transform (window origin) so client-
+      // area drawing through a window DC still lands correctly and NC-band
+      // drawing clips out; balanced by ReleaseDC → releaseChildDC.
+      if (childDCSet.has(hdcNc!)) releaseChildDC(emu, hdcNc!);
+      dc.canvas = emu.canvas!;
+      dc.ctx = emu.canvasCtx;
+      dc.ctx.save();
+      dc.ctx.setTransform(1, 0, 0, 1, -bw, -(bw + captionH + menuH));
+      childDCSet.add(hdcNc!);
+    }
+    return hdcNc!;
+  }
   const isDescendant = wnd && hwnd !== emu.mainWindow && isDescendantOfMain(emu, hwnd);
   // Visible popup windows (not main, not descendant) also draw on the main canvas
   const isPopup = wnd && hwnd !== emu.mainWindow && !isDescendant && wnd.visible && emu.canvas && emu.canvasCtx;
@@ -150,11 +316,13 @@ export function getWindowDC(emu: Emulator, hwnd: number): number {
       if (internalH && internalH > wnd.height) {
         ccsYOffset = Math.round((internalH - wnd.height) / 2);
       }
+      const a = dcArea(emu, wnd, origin, windowRelative);
       dc.ctx.save();
-      dc.ctx.setTransform(1, 0, 0, 1, origin.x, origin.y + ccsYOffset);
+      dc.ctx.setTransform(1, 0, 0, 1, a.x, a.y + ccsYOffset);
       dc.ctx.beginPath();
-      dc.ctx.rect(0, -ccsYOffset, wnd.width, wnd.height);
+      dc.ctx.rect(0, -ccsYOffset, a.w, a.h);
       dc.ctx.clip();
+      if (!isPopup) clipUpperSiblings(emu, hwnd, wnd, dc.ctx, a, ccsYOffset);
       childDCSet.add(existing);
       return existing;
     }
@@ -214,11 +382,13 @@ export function getWindowDC(emu: Emulator, hwnd: number): number {
     if (internalH && internalH > wnd.height) {
       ccsYOffset = Math.round((internalH - wnd.height) / 2);
     }
+    const a = dcArea(emu, wnd, origin, windowRelative);
     ctx.save();
-    ctx.setTransform(1, 0, 0, 1, origin.x, origin.y + ccsYOffset);
+    ctx.setTransform(1, 0, 0, 1, a.x, a.y + ccsYOffset);
     ctx.beginPath();
-    ctx.rect(0, -ccsYOffset, wnd.width, wnd.height);
+    ctx.rect(0, -ccsYOffset, a.w, a.h);
     ctx.clip();
+    if (!isPopup) clipUpperSiblings(emu, hwnd, wnd, ctx, a, ccsYOffset);
     // Fill CCS toolbar background — the DC is shifted down so the top strip
     // would otherwise show the canvas background color instead of BTNFACE.
     if (ccsYOffset > 0) {
@@ -234,15 +404,19 @@ export function getWindowDC(emu: Emulator, hwnd: number): number {
 const WS_CLIPCHILDREN = 0x02000000;
 
 function applyClipChildren(emu: Emulator, hwnd: number, wnd: WindowInfo | null, hdc: number): void {
-  if (!wnd || !(wnd.style & WS_CLIPCHILDREN) || !wnd.childList || hwnd !== emu.mainWindow) return;
+  // Any window with WS_CLIPCHILDREN (not just the main window): a parent must
+  // never erase/paint over its children's rects — e.g. an MFC sizing control
+  // bar's BTNFACE erase would grey out the docked view inside it.
+  if (!wnd || !(wnd.style & WS_CLIPCHILDREN) || !wnd.childList) return;
   const dc = getDC(emu, hdc);
   if (!dc) return;
 
-  // Collect visible child rects
+  // Collect visible child rects (coords are parent-client-relative — the same
+  // local space the DC transform maps for both the main window and children).
   const childRects: { x: number; y: number; w: number; h: number }[] = [];
   for (const childHwnd of wnd.childList) {
     const child = emu.handles.get<WindowInfo>(childHwnd);
-    if (!child || !child.visible) continue;
+    if (!child || !child.visible || child.width <= 0 || child.height <= 0) continue;
     childRects.push({ x: child.x, y: child.y, w: child.width, h: child.height });
   }
   if (childRects.length === 0) return;
@@ -250,28 +424,69 @@ function applyClipChildren(emu: Emulator, hwnd: number, wnd: WindowInfo | null, 
   dc.ctx.save();
   clipChildrenDCSet.add(hdc);
 
-  // Create a clip path that is the canvas rect minus child rects
-  // Using evenodd: outer rect CW + child rects CW will clip out the children
-  const cw = dc.canvas.width;
-  const ch = dc.canvas.height;
-  dc.ctx.beginPath();
-  dc.ctx.rect(0, 0, cw, ch);
+  // Subtract each child rect with its OWN evenodd clip (successive clips
+  // intersect = full area minus the UNION of child rects). One combined
+  // evenodd path breaks when child rects overlap each other: the doubly
+  // covered region flips back to paintable.
+  const seen = new Set<string>();
   for (const r of childRects) {
-    // Draw child rect in reverse winding (CCW) for evenodd clipping
-    dc.ctx.moveTo(r.x, r.y);
-    dc.ctx.lineTo(r.x, r.y + r.h);
-    dc.ctx.lineTo(r.x + r.w, r.y + r.h);
-    dc.ctx.lineTo(r.x + r.w, r.y);
-    dc.ctx.closePath();
+    const key = `${r.x},${r.y},${r.w},${r.h}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    dc.ctx.beginPath();
+    dc.ctx.rect(-1e7, -1e7, 2e7, 2e7);
+    dc.ctx.rect(r.x, r.y, r.w, r.h);
+    dc.ctx.clip('evenodd');
   }
-  dc.ctx.clip('evenodd');
+}
+
+/**
+ * Paint the custom NC margin (ncInset) of a window: fill it with the class
+ * background (BTNFACE fallback) on a window-relative DC, then send WM_NCPAINT
+ * so the app draws its own NC chrome (e.g. CSizingControlBar edges/gripper).
+ * Real BeginPaint sends WM_NCPAINT when the update region includes the frame;
+ * without this the margin reserved by WM_NCCALCSIZE keeps stale pixels.
+ */
+function paintNcMargin(emu: Emulator, hwnd: number, wnd: WindowInfo): void {
+  const inset = wnd.ncInset!;
+  const hdc = getWindowDC(emu, hwnd, true);
+  const dc = getDC(emu, hdc);
+  if (dc) {
+    let bg = SYS_COLORS[COLOR_BTNFACE];
+    const brush = wnd.classInfo.hbrBackground ? getBrush(emu, wnd.classInfo.hbrBackground) : null;
+    if (brush && !brush.isNull) bg = brush.color;
+    dc.ctx.fillStyle = `rgb(${bg & 0xFF},${(bg >> 8) & 0xFF},${(bg >> 16) & 0xFF})`;
+    const w = wnd.width, h = wnd.height;
+    if (inset.t > 0) dc.ctx.fillRect(0, 0, w, inset.t);
+    if (inset.b > 0) dc.ctx.fillRect(0, h - inset.b, w, inset.b);
+    if (inset.l > 0) dc.ctx.fillRect(0, 0, inset.l, h);
+    if (inset.r > 0) dc.ctx.fillRect(w - inset.r, 0, inset.r, h);
+  }
+  releaseChildDC(emu, hdc);
+  if (wnd.wndProc && !(emu as any)._inNcPaint) {
+    (emu as any)._inNcPaint = true;
+    try {
+      emu.callWndProc(wnd.wndProc, hwnd, WM_NCPAINT, 1, 0);
+    } catch {
+      // An NC paint handler fault must not abort the paint cycle.
+    } finally {
+      (emu as any)._inNcPaint = false;
+    }
+  }
 }
 
 export function beginPaint(emu: Emulator, hwnd: number): number {
+  // A custom NC margin repaints with the window (sent before the client paint
+  // DC is armed, so the app's WM_NCPAINT GetWindowDC/ReleaseDC stays balanced).
+  const wndNc = emu.handles.get<WindowInfo>(hwnd);
+  if (wndNc?.ncInset && wndNc.needsErase) paintNcMargin(emu, hwnd, wndNc);
   const hdc = getWindowDC(emu, hwnd);
   // Validate the region — clear needsPaint to prevent infinite WM_PAINT loop
   const wnd = emu.handles.get<WindowInfo>(hwnd);
-  if (wnd) { wnd.needsPaint = false; wnd.needsErase = false; wnd.painting = true; }
+  // Capture the erase request before clearing it: real BeginPaint sends
+  // WM_ERASEBKGND only when the update region was invalidated with bErase=TRUE.
+  const hadErase = wnd?.needsErase ?? false;
+  if (wnd) { wnd.needsPaint = false; wnd.needsErase = false; wnd._paintSynthesized = false; wnd.painting = true; }
   // Signal to DispatchMessage that BeginPaint was called (so it doesn't duplicate overlay notifications)
   emu._dispatchPaintUsedBeginPaint = true;
 
@@ -280,8 +495,12 @@ export function beginPaint(emu: Emulator, hwnd: number): number {
   applyClipChildren(emu, hwnd, wnd, hdc);
 
   // Erase background: for dialogs, use COLOR_BTNFACE (WM_CTLCOLORDLG default);
-  // for regular windows, use the class brush
-  if (wnd) {
+  // for regular windows, use the class brush. Real BeginPaint erases ONLY when
+  // the update region was invalidated with bErase=TRUE, and only the update
+  // region itself — a partial bErase=FALSE invalidation (e.g. a caret-blink
+  // cell) must NOT wipe the rest of the window, or content drawn during
+  // WM_ERASEBKGND (custom guides, grids) flickers at every blink tick.
+  if (wnd && hadErase) {
     const dc = getDC(emu, hdc);
     if (dc) {
       const isDialog = wnd.classInfo.className === '#32770' || !!wnd.dlgProc;
@@ -294,8 +513,40 @@ export function beginPaint(emu: Emulator, hwnd: number): number {
       }
       if (bgColor !== null) {
         const r = bgColor & 0xFF, g = (bgColor >> 8) & 0xFF, b = (bgColor >> 16) & 0xFF;
+        // Clip the erase to the accumulated invalid rect (still intact here —
+        // the BeginPaint API handler consumes it into paintRect afterwards).
+        let el = 0, et = 0, er = wnd.width, eb = wnd.height;
+        const ir = wnd.invalidRect;
+        if (ir) {
+          el = Math.max(0, ir.l); et = Math.max(0, ir.t);
+          er = Math.min(wnd.width, ir.r); eb = Math.min(wnd.height, ir.b);
+          if (er < el) er = el;
+          if (eb < et) eb = et;
+        }
         dc.ctx.fillStyle = `rgb(${r},${g},${b})`;
-        dc.ctx.fillRect(0, 0, wnd.width, wnd.height);
+        dc.ctx.fillRect(el, et, er - el, eb - et);
+      }
+    }
+
+    // Dispatch WM_ERASEBKGND to the window procedure, exactly as the real
+    // BeginPaint does when the update region needs erasing. This lets apps that
+    // OVERRIDE OnEraseBkgnd run their custom code (custom backgrounds, grid /
+    // column-guide overlays drawn with a PS_DOT pen, etc.). Windows that don't
+    // override fall through to DefWindowProc, which fills the class brush — so
+    // the direct fill above is redundant-but-harmless for them and a safe
+    // fallback for built-in (wndProc-less) and dialog windows. Guarded by
+    // _inEraseBkgnd so a handler that itself paints can't recurse here, and
+    // gated on hadErase so the cursor-blink partial repaints (invalidated with
+    // bErase=FALSE) don't re-run a full erase every tick.
+    const isDialog = wnd.classInfo.className === '#32770' || !!wnd.dlgProc;
+    if (hadErase && wnd.wndProc && !isDialog && !emu._inEraseBkgnd) {
+      emu._inEraseBkgnd = true;
+      try {
+        emu.callWndProc(wnd.wndProc, hwnd, WM_ERASEBKGND, hdc, 0);
+      } catch {
+        // An erase handler fault must not abort the paint cycle.
+      } finally {
+        emu._inEraseBkgnd = false;
       }
     }
   }
@@ -504,7 +755,7 @@ export function loadBitmapResource(emu: Emulator, resourceId: number): number {
     try {
       const dibData = new Uint8Array(srcBuf, entry.fileOffset, entry.length);
       const { canvas, ctx, imageData, width, height } = decodeDib(dibData);
-      const bmp: BitmapInfo = { width, height, canvas, ctx, imageData };
+      const bmp: BitmapInfo = { width, height, canvas, ctx, imageData, resourceId };
       const hBitmap = emu.handles.alloc('bitmap', bmp);
       emu.bitmapCache.set(resourceId, hBitmap);
       // console.log(`[NE] Loaded bitmap resource ${resourceId}: ${width}x${height} → handle ${hBitmap}`);
@@ -533,7 +784,7 @@ export function loadBitmapResource(emu: Emulator, resourceId: number): number {
     const dibData = new Uint8Array(emu.arrayBuffer, fileOffset, lang.dataSize);
     const { canvas, ctx, imageData, width, height } = decodeDib(dibData);
 
-    const bmp: BitmapInfo = { width, height, canvas, ctx, imageData };
+    const bmp: BitmapInfo = { width, height, canvas, ctx, imageData, resourceId };
     const hBitmap = emu.handles.alloc('bitmap', bmp);
     emu.bitmapCache.set(resourceId, hBitmap);
     return hBitmap;
@@ -626,7 +877,7 @@ export function loadBitmapResourceFromModule(emu: Emulator, hInstance: number, r
         dibBytes[i] = emu.memory.readU8(dataAddr + i);
       }
       const { canvas, ctx, imageData, width, height } = decodeDib(dibBytes);
-      const bmp: BitmapInfo = { width, height, canvas, ctx, imageData };
+      const bmp: BitmapInfo = { width, height, canvas, ctx, imageData, resourceId, resourceModule: hInstance };
       const hBitmap = emu.handles.alloc('bitmap', bmp);
       emu.bitmapCache.set(cacheKey, hBitmap);
       console.log(`[DLL] Loaded bitmap resource ${resourceId} from module 0x${hInstance.toString(16)}: ${width}x${height}`);
@@ -817,6 +1068,20 @@ export function loadCursorResourceByName(emu: Emulator, name: string): number {
   }
 }
 
+// Standard MFC framework strings (afxres.h). MFC apps that link the shared
+// MFC42.DLL load these by ID from MFC's own string table — which our MFC42 stub
+// does not carry. CFrameWnd::SetMessageText(AFX_IDS_IDLEMESSAGE) puts "Ready" in
+// status-bar pane 0 during idle; without it the pane stays blank. These IDs live
+// in the reserved AFX range (0xE000+) so they never collide with an app's own
+// string resources, and the app's table takes precedence when it defines one.
+const AFX_STD_STRINGS: Record<number, string> = {
+  0xE001: 'Ready',                                          // AFX_IDS_IDLEMESSAGE
+  0xE002: 'Select an object on which to get Help',          // AFX_IDS_HELPMODEMESSAGE
+};
+
 export function loadStringResource(emu: Emulator, id: number): string | null {
-  return emu.stringCache.get(id) || null;
+  const cached = emu.stringCache.get(id);
+  if (cached !== undefined) return cached;
+  if (id in AFX_STD_STRINGS) return AFX_STD_STRINGS[id];
+  return null;
 }

@@ -8,27 +8,144 @@ import {
   WM_QUIT, WM_PAINT, WM_ERASEBKGND,
   WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH,
   WM_CREATE, WM_NCCREATE, WM_NCCALCSIZE,
-  WM_TIMER, PM_REMOVE, CW_USEDEFAULT,
+  WM_TIMER, WM_LBUTTONUP, WM_COMMAND, PM_REMOVE, CW_USEDEFAULT,
   TBM_GETPOS, TBM_GETRANGEMIN, TBM_GETRANGEMAX,
   TBM_SETPOS, TBM_SETRANGE, TBM_SETRANGEMIN, TBM_SETRANGEMAX,
 } from '../types';
 
+/** Hit-test a click against the toolbar's button layout. Mirrors the layout
+ *  computed by renderToolbar (emu-render.ts) : tbButtonSize cells laid out
+ *  horizontally with TBSTYLE_SEP buttons used as spacers. Returns the clicked
+ *  button's idCommand, or 0 if none / hidden / separator. */
+/** Client rect of toolbar button `index`, from the same layout walk as
+ *  toolbarHitTest/renderToolbar. Separators occupy their iBitmap width
+ *  (default 6), hidden buttons occupy nothing. Returns null if out of range. */
+function toolbarItemRect(tb: WindowInfo, index: number): { l: number; t: number; r: number; b: number } | null {
+  const buttons = tb.tbButtons;
+  if (!buttons || index < 0 || index >= buttons.length) return null;
+  const TBSTATE_HIDDEN = 0x08;
+  const TBSTYLE_SEP    = 0x01;
+  let btnW = 22, btnH = 22;
+  if (tb.tbButtonSize !== undefined) {
+    btnW = tb.tbButtonSize & 0xFFFF;
+    btnH = (tb.tbButtonSize >>> 16) & 0xFFFF;
+  }
+  let x = 2;
+  for (let i = 0; i < buttons.length; i++) {
+    const b = buttons[i];
+    const w = (b.fsState & TBSTATE_HIDDEN) ? 0
+      : (b.fsStyle & TBSTYLE_SEP) ? (b.iBitmap > 0 ? b.iBitmap : 6)
+      : btnW;
+    if (i === index) return { l: x, t: 2, r: x + w, b: 2 + btnH };
+    x += w;
+  }
+  return null;
+}
+
+function toolbarHitTest(tb: WindowInfo, x: number, y: number): number {
+  const buttons = tb.tbButtons;
+  if (!buttons || buttons.length === 0) return 0;
+  const TBSTATE_HIDDEN = 0x08;
+  const TBSTYLE_SEP    = 0x01;
+  for (let i = 0; i < buttons.length; i++) {
+    const b = buttons[i];
+    if (b.fsState & TBSTATE_HIDDEN) continue;
+    if (b.fsStyle & TBSTYLE_SEP) continue;
+    const r = toolbarItemRect(tb, i);
+    if (r && x >= r.l && x < r.r && y >= r.t && y < r.b) {
+      return b.idCommand >>> 0;
+    }
+  }
+  return 0;
+}
+
 export function registerMessage(emu: Emulator): void {
   const user32 = emu.registerDll('USER32.DLL');
 
+  // A window paints only if it AND every ancestor up to the main window is
+  // visible. A hidden window (or one under a hidden parent) must never erase or
+  // paint — on the shared canvas its background fill would blank whatever now
+  // occupies its slot (e.g. a hidden CSizingControlBar greying out the pane
+  // that took its place after RecalcLayout).
+  const isEffectivelyVisible = (h: number): boolean => {
+    let cur = h, guard = 0;
+    while (cur && guard++ < 64) {
+      const w = emu.handles.get<WindowInfo>(cur);
+      if (!w || !w.visible) return false;
+      if (cur === emu.mainWindow) break;
+      cur = w.parent || 0;
+    }
+    return true;
+  };
+
+  // hWnd filter matching, real-Windows semantics: 0 = any window of the
+  // thread; -1 = thread messages only (hwnd 0); otherwise the window itself
+  // or any of its descendants (GetMessage/PeekMessage retrieve messages for
+  // hWnd "or any of its children, as specified by IsChild").
+  const HWND_THREAD_ONLY = 0xFFFFFFFF;
+  const matchesHwndFilter = (filterHwnd: number, msgHwnd: number): boolean => {
+    if (filterHwnd === 0) return true;
+    if (filterHwnd === HWND_THREAD_ONLY) return msgHwnd === 0;
+    let cur = msgHwnd, guard = 0;
+    while (cur && guard++ < 64) {
+      if (cur === filterHwnd) return true;
+      cur = emu.handles.get<WindowInfo>(cur)?.parent || 0;
+    }
+    return false;
+  };
+
+  // Find the first queued message matching the filters. WM_QUIT bypasses
+  // them: real GetMessage returns it regardless of the hWnd/range filters
+  // (otherwise a modal loop pumping a specific hwnd would hang after
+  // PostQuitMessage), but only once no other matching message precedes it.
+  const findQueuedMessage = (filterHwnd: number, msgFilterMin: number, msgFilterMax: number): number => {
+    const hasFilter = msgFilterMin !== 0 || msgFilterMax !== 0;
+    let quitIdx = -1;
+    for (let i = 0; i < emu.messageQueue.length; i++) {
+      const msg = emu.messageQueue[i];
+      if (msg.message === WM_QUIT) { if (quitIdx < 0) quitIdx = i; continue; }
+      if (!matchesHwndFilter(filterHwnd, msg.hwnd)) continue;
+      if (hasFilter && (msg.message < msgFilterMin || msg.message > msgFilterMax)) continue;
+      return i;
+    }
+    return quitIdx;
+  };
+
   // Message loop
-  // Synthesize WM_PAINT for windows that need repainting
-  const synthesizePaint = (): { hwnd: number; message: number; wParam: number; lParam: number } | null => {
+  // Synthesize WM_PAINT for windows that need repainting.
+  // `consume` is true for calls that hand the message to the app for
+  // processing (GetMessage, PeekMessage PM_REMOVE) and false for non-removing
+  // peeks (PM_NOREMOVE), which must not affect pending-paint state.
+  // `filterHwnd` restricts synthesis to that window and its descendants, so a
+  // filtered pump can't steal (and mark consumed) another window's paint.
+  const synthesizePaint = (consume: boolean, filterHwnd = 0): { hwnd: number; message: number; wParam: number; lParam: number } | null => {
     // Check all windows for needsPaint flag
     for (const [handle, wnd] of emu.handles.findByType('window') as [number, WindowInfo][]) {
       if (!wnd || !wnd.needsPaint) continue;
+      if (!matchesHwndFilter(filterHwnd, handle)) continue;
+      if (!isEffectivelyVisible(handle)) { wnd.needsPaint = false; wnd.needsErase = false; continue; }
       if (wnd.wndProc) {
-        if (wnd.needsErase) {
-          wnd.needsErase = false;
-          return { hwnd: handle, message: WM_ERASEBKGND, wParam: emu.getWindowDC(handle), lParam: 0 };
+        // Real Windows never queue-delivers WM_ERASEBKGND: BeginPaint sends it
+        // with the paint DC when the region was invalidated with bErase=TRUE,
+        // and EndPaint releases that DC. Synthesizing it here armed a child DC
+        // (getWindowDC save+clip on the shared canvas) that nothing released —
+        // the stale clip then intersected every later window's clip until
+        // painting was fully suppressed. Leave needsErase for beginPaint.
+        // Like real Windows, WM_PAINT stays pending until BeginPaint /
+        // ValidateRect validates the region — clearing needsPaint on synthesis
+        // lost the paint when the app peeked with PM_NOREMOVE first (MFC's
+        // CWinThread::Run idle loop) and only then called GetMessage. But if
+        // the app already consumed a WM_PAINT for this invalidation and never
+        // validated, validate now instead of re-delivering forever.
+        if (consume) {
+          if (wnd._paintSynthesized) {
+            wnd.needsPaint = false;
+            wnd.needsErase = false;
+            wnd._paintSynthesized = false;
+            continue;
+          }
+          wnd._paintSynthesized = true;
         }
-        // Clear needsPaint here to prevent infinite WM_PAINT if WndProc doesn't call BeginPaint
-        wnd.needsPaint = false;
         return { hwnd: handle, message: WM_PAINT, wParam: 0, lParam: 0 };
       }
       // Built-in windows (no wndProc) with a class brush: erase background directly
@@ -46,6 +163,8 @@ export function registerMessage(emu: Emulator): void {
             emu.syncDCToCanvas(hdc);
           }
         }
+        // Balance the save/clip armed by getWindowDC on the shared canvas
+        emu.releaseChildDC(hdc);
       } else {
         wnd.needsPaint = false;
       }
@@ -55,28 +174,37 @@ export function registerMessage(emu: Emulator): void {
 
   user32.register('GetMessageA', 4, () => {
     const pMsg = emu.readArg(0);
-    const _hWnd = emu.readArg(1);
-    const _msgFilterMin = emu.readArg(2);
-    const _msgFilterMax = emu.readArg(3);
+    const hWnd = emu.readArg(1);
+    const msgFilterMin = emu.readArg(2);
+    const msgFilterMax = emu.readArg(3);
+    const hasFilter = msgFilterMin !== 0 || msgFilterMax !== 0;
+    const wantsPaint = !hasFilter || (WM_PAINT >= msgFilterMin && WM_PAINT <= msgFilterMax);
 
-    if (emu.messageQueue.length > 0) {
-      const msg = emu.messageQueue.shift()!;
-      writeMsgStruct(emu, pMsg, msg);
-      return msg.message === WM_QUIT ? 0 : 1;
+    const tryRetrieve = (): { hwnd: number; message: number; wParam: number; lParam: number } | null => {
+      const idx = findQueuedMessage(hWnd, msgFilterMin, msgFilterMax);
+      if (idx >= 0) return emu.messageQueue.splice(idx, 1)[0];
+      // Synthesize WM_PAINT if a matching window needs repainting
+      if (wantsPaint) return synthesizePaint(true, hWnd);
+      return null;
+    };
+
+    const first = tryRetrieve();
+    if (first) {
+      writeMsgStruct(emu, pMsg, first);
+      return first.message === WM_QUIT ? 0 : 1;
     }
 
-    // Synthesize WM_PAINT if any window needs repainting
-    const paintMsg = synthesizePaint();
-    if (paintMsg) {
-      writeMsgStruct(emu, pMsg, paintMsg);
-      return 1;
-    }
-
-    // Queue is empty — set up callback and wait
+    // No matching message — set up callback and wait. A posted message that
+    // does NOT match the filters must not wake the caller (real GetMessage
+    // keeps blocking), so re-arm until a matching one arrives.
     const stackBytes = emu._currentThunkStackBytes;
     emu.waitingForMessage = true;
-    emu._onMessageAvailable = () => {
-      const msg = emu.messageQueue.shift()!;
+    const onAvailable = (): void => {
+      const msg = tryRetrieve();
+      if (!msg) {
+        emu._onMessageAvailable = onAvailable;
+        return;
+      }
       writeMsgStruct(emu, pMsg, msg);
       emu.waitingForMessage = false;
       emuCompleteThunk(emu, msg.message === WM_QUIT ? 0 : 1, stackBytes);
@@ -84,6 +212,7 @@ export function registerMessage(emu: Emulator): void {
         requestAnimationFrame(emu.tick);
       }
     };
+    emu._onMessageAvailable = onAvailable;
     return undefined;
   });
 
@@ -94,12 +223,13 @@ export function registerMessage(emu: Emulator): void {
     const msgFilterMax = emu.readArg(3);
     const removeFlag = emu.readArg(4);
 
-    // Find first message matching the filter
+    // Find first message matching the filter (hWnd matches the window or any
+    // of its descendants, like real PeekMessage)
     const hasFilter = msgFilterMin !== 0 || msgFilterMax !== 0;
     let idx = -1;
     for (let i = 0; i < emu.messageQueue.length; i++) {
       const msg = emu.messageQueue[i];
-      if (hWnd !== 0 && msg.hwnd !== hWnd) continue;
+      if (!matchesHwndFilter(hWnd, msg.hwnd)) continue;
       if (hasFilter && (msg.message < msgFilterMin || msg.message > msgFilterMax)) continue;
       idx = i;
       break;
@@ -115,9 +245,13 @@ export function registerMessage(emu: Emulator): void {
     // Only at the top-level message loop (depth 0) to avoid consuming WM_PAINT
     // prematurely during init or nested WndProc calls.
     if (emu.wndProcDepth === 0) {
-      const paintMsg = synthesizePaint();
-      if (paintMsg) {
-        if (!hasFilter || (paintMsg.message >= msgFilterMin && paintMsg.message <= msgFilterMax)) {
+      // synthesizePaint only ever returns WM_PAINT — check the filter BEFORE
+      // synthesizing so a consuming call can't mark a paint as delivered and
+      // then drop it on a filter mismatch. The hWnd filter is passed through
+      // so a window-specific peek can't steal another window's paint.
+      if (!hasFilter || (WM_PAINT >= msgFilterMin && WM_PAINT <= msgFilterMax)) {
+        const paintMsg = synthesizePaint((removeFlag & PM_REMOVE) !== 0, hWnd);
+        if (paintMsg) {
           writeMsgStruct(emu, pMsg, paintMsg);
           return 1;
         }
@@ -293,8 +427,32 @@ export function registerMessage(emu: Emulator): void {
       return builtin ?? 0;
     }
 
-    // Call WndProc via stack frame replacement
+    // Toolbar click hit-test : MFC's CToolBar subclass wndProc can't reliably
+    // find the clicked button because COMCTL32's internal layout state isn't
+    // tracked in the emulator. So we hit-test against tb.tbButtons (the same
+    // layout used by renderToolbar) and synthesize WM_COMMAND on the parent.
+    const tbClassName = wnd.classInfo?.className?.toUpperCase();
+    if (tbClassName === 'TOOLBARWINDOW32' && message === WM_LBUTTONUP) {
+      const cmd = toolbarHitTest(wnd, lParam & 0xFFFF, (lParam >> 16) & 0xFFFF);
+      if (cmd > 0 && wnd.parent) {
+        const parent = emu.handles.get<WindowInfo>(wnd.parent);
+        if (parent?.wndProc) {
+          // WM_COMMAND : wParam = HIWORD(notification)|LOWORD(id),
+          //              lParam = control hwnd (0 for menu/accelerator).
+          // Toolbar uses notification code 0 (button click).
+          emu.callWndProc(parent.wndProc, wnd.parent, WM_COMMAND, cmd & 0xFFFF, hwnd);
+          return 0; // skip MFC's own click handling
+        }
+      }
+    }
+
+    // Call WndProc via stack frame replacement.
+    // DispatchMessage propagates `undefined` correctly, so it's safe to let
+    // callStdcall yield mid-wndProc when this dispatch takes too long.
+    const prevAllow = emu._allowWndProcYield;
+    emu._allowWndProcYield = true;
     const ret = emu.callWndProc(wnd.wndProc, hwnd, message, wParam, lParam);
+    emu._allowWndProcYield = prevAllow;
     if (ret === undefined) return undefined; // deferred — post-processing skipped
 
     // WM_GETMINMAXINFO caching is now handled by clampToMinTrackSize() in _helpers.ts
@@ -309,6 +467,16 @@ export function registerMessage(emu: Emulator): void {
     // (e.g. Delphi apps). Apps that do call BeginPaint already get overlays via endPaint.
     if (trackPaint && !emu._dispatchPaintUsedBeginPaint) {
       emu.notifyControlOverlays();
+    }
+
+    // WM_PAINT stays pending until validated (synthesizePaint no longer clears
+    // it). If the wndProc handled WM_PAINT without BeginPaint/ValidateRect the
+    // flag is still set here — validate now, like the system does, so the same
+    // WM_PAINT isn't re-synthesized forever.
+    if (message === WM_PAINT && wnd.needsPaint) {
+      wnd.needsPaint = false;
+      wnd.needsErase = false;
+      wnd._paintSynthesized = false;
     }
 
     return ret;
@@ -482,7 +650,13 @@ export function registerMessage(emu: Emulator): void {
     }
 
     if (message === WM_SETTEXT && lParam) {
-      const newTitle = wide ? emu.memory.readUTF16String(lParam) : emu.memory.readCString(lParam);
+      // SetWindowTextA/W routes here via DefWindowProc/DefDlgProc, but the shared
+      // dialog wndProc can't tell A from W, so `wide` defaults to false. Prefer
+      // the _setTextUnicode flag set by SetWindowTextA/W for the duration of the
+      // send; otherwise honour `wide`, then fall back to a UTF-16 byte sniff.
+      const uni = (emu as any)._setTextUnicode ??
+        (wide || (emu.memory.readU8(lParam) !== 0 && emu.memory.readU8(lParam + 1) === 0));
+      const newTitle = uni ? emu.memory.readUTF16String(lParam) : emu.memory.readCString(lParam);
       const cls = (wnd.classInfo?.baseClassName || wnd.classInfo?.className || '').toUpperCase();
       if (cls === 'EDIT') {
         console.log(`[EDIT] WM_SETTEXT hwnd=0x${hwnd.toString(16)} text="${newTitle}"`);
@@ -1775,18 +1949,41 @@ export function registerMessage(emu: Emulator): void {
     // StatusBar messages
     if (cn === 'MSCTLS_STATUSBAR32') {
       const WM_SIZE = 0x0005;
+      const WM_NCCREATE = 0x0081;
+      const WM_SETTEXT_SB = 0x000C;
       const SB_SETTEXTW = 0x040B;
+      const SB_SETTEXTA = 0x0401;
+      const SB_GETTEXTLENGTHA = 0x0403;
+      const SB_GETTEXTA = 0x0402;
+      const SB_GETPARTS = 0x0406;
       const SB_SETPARTS = 0x0404;
       const SB_SIMPLE = 0x0409;
-      // Status bars auto-resize to bottom of parent on WM_SIZE
+      const SB_GETBORDERS = 0x0407;
+      const SB_GETRECT = 0x040A;
+      // CStatusBar::Create passes CW_USEDEFAULT for height; MFC then waits for
+      // the bar to "self-size" before docking. If we leave wnd.height at 0,
+      // CFrameWnd::CalcDynamicLayout reserves 0 px and the status bar never
+      // shows. Seed a reasonable default at NCCREATE so the initial layout
+      // pass already gives the bar some thickness.
+      if (message === WM_NCCREATE) {
+        if (!wnd.height) wnd.height = 22;
+        return 1;
+      }
+      // Status bars auto-resize to bottom of parent on WM_SIZE. Real CStatusBar
+      // measures the font height + padding; we use a flat ~22 px default which
+      // matches Win2k Tahoma. Without assigning the height the bar stays 0 px
+      // tall and CFrameWnd::CalcWindowRect subtracts 0 from the client area —
+      // collapsing the status bar entirely (PabloDraw's "where is my status
+      // bar" bug).
       if (message === WM_SIZE) {
         const parentWnd = emu.handles.get<WindowInfo>(wnd.parent);
         if (parentWnd) {
           const { cw, ch } = getClientSize(parentWnd.style, parentWnd.hMenu !== 0, parentWnd.width, parentWnd.height);
-          const statusH = wnd.height || 20;
+          const statusH = wnd.height || 22;
           wnd.x = 0;
           wnd.y = ch - statusH;
           wnd.width = cw;
+          wnd.height = statusH;
         }
         return 0;
       }
@@ -1798,13 +1995,77 @@ export function registerMessage(emu: Emulator): void {
         if (!wnd.statusTexts) wnd.statusTexts = [];
         return 1;
       }
+      // SB_GETBORDERS writes int[3]: horizontal border, vertical border, gap
+      // between parts. MFC's CStatusBar::UpdateAllPanes reads these into a
+      // stack array and bases every pane position on them — leaving the array
+      // unwritten fed stack garbage into SB_SETPARTS (broken pane layout).
+      if (message === SB_GETBORDERS) {
+        if (lParam) {
+          emu.memory.writeI32(lParam, 0);     // SM_CXBORDER-ish horizontal
+          emu.memory.writeI32(lParam + 4, 2); // vertical
+          emu.memory.writeI32(lParam + 8, 2); // gap between parts
+        }
+        return 1;
+      }
+      if (message === SB_GETPARTS) {
+        const parts = wnd.statusParts ?? [];
+        if (lParam) {
+          const n = Math.min(wParam, parts.length);
+          for (let i = 0; i < n; i++) emu.memory.writeI32(lParam + i * 4, parts[i]);
+        }
+        return parts.length;
+      }
+      if (message === SB_GETRECT) {
+        const parts = wnd.statusParts ?? [];
+        if (wParam >= parts.length || !lParam) return 0;
+        const left = wParam === 0 ? 0 : parts[wParam - 1];
+        const right = parts[wParam] === -1 ? wnd.width : parts[wParam];
+        emu.memory.writeI32(lParam, left);
+        emu.memory.writeI32(lParam + 4, 2);
+        emu.memory.writeI32(lParam + 8, right);
+        emu.memory.writeI32(lParam + 12, Math.max(2, wnd.height - 2));
+        return 1;
+      }
       if (message === SB_SETTEXTW) {
         const part = wParam & 0xFF;
         if (!wnd.statusTexts) wnd.statusTexts = [];
         wnd.statusTexts[part] = lParam ? emu.memory.readUTF16String(lParam) : '';
+        if (emu.notifyControlOverlays) emu.notifyControlOverlays();
+        return 1;
+      }
+      // The real control treats WM_SETTEXT as "set part 0 text" (non-simple
+      // mode) — SetWindowText(statusBar, ...) is the documented way to set the
+      // message pane for apps that don't subclass the control.
+      if (message === WM_SETTEXT_SB) {
+        if (!wnd.statusTexts) wnd.statusTexts = [];
+        const uni = (emu as any)._setTextUnicode ??
+          (lParam !== 0 && emu.memory.readU8(lParam) !== 0 && emu.memory.readU8(lParam + 1) === 0);
+        wnd.statusTexts[0] = lParam ? (uni ? emu.memory.readUTF16String(lParam) : emu.memory.readCString(lParam)) : '';
+        if (emu.notifyControlOverlays) emu.notifyControlOverlays();
+        return 1;
+      }
+      if (message === SB_SETTEXTA) {
+        const part = wParam & 0xFF;
+        if (!wnd.statusTexts) wnd.statusTexts = [];
+        wnd.statusTexts[part] = lParam ? emu.memory.readCString(lParam) : '';
+        if (emu.notifyControlOverlays) emu.notifyControlOverlays();
         return 1;
       }
       if (message === SB_SIMPLE) return 1;
+      const SB_GETTEXTW = 0x040D;
+      const SB_GETTEXTLENGTHW = 0x040C;
+      if (message === SB_GETTEXTLENGTHA || message === SB_GETTEXTLENGTHW) {
+        const t = wnd.statusTexts?.[wParam & 0xFF] ?? '';
+        return t.length; // LOWORD=length, HIWORD=uType(0)
+      }
+      if (message === SB_GETTEXTA || message === SB_GETTEXTW) {
+        const t = wnd.statusTexts?.[wParam & 0xFF] ?? '';
+        if (lParam) {
+          if (message === SB_GETTEXTW) emu.memory.writeUTF16String(lParam, t);
+          else emu.memory.writeCString(lParam, t);
+        }
+        return t.length;
+      }
       if (message >= 0x0400 && message < 0x0500) return 0;
     }
 
@@ -1861,8 +2122,211 @@ export function registerMessage(emu: Emulator): void {
       if (message === EM_GETTEXTLENGTHEX) return 0;
     }
 
+    // ToolbarWindow32 (TB_*) — minimum stubs so MFC's CToolBar setup succeeds.
+    // Real Windows toolbar tracks button arrays internally and renders them;
+    // we don't need to do that for headless tests but we must return TRUE
+    // for TB_ADDBUTTONS or MFC's CToolBar::SetButtons fails → LoadToolBar
+    // returns FALSE → CMainFrame::OnCreate returns -1.
+    if (cn === 'TOOLBARWINDOW32') {
+      // When MFC dispatches WM_PAINT directly to the toolbar (via
+      // UpdateWindow on a child or via the message pump after
+      // InvalidateRect), our DispatchMessage routes here. Built-in
+      // class with wndProc=0 would otherwise return 0 and paint nothing.
+      // Flag the main window for repaint so renderChildControls runs
+      // its renderToolbar() pass.
+      const WM_PAINT_LOC = 0x000F;
+      const WM_ERASEBKGND_LOC = 0x0014;
+      if (message === WM_PAINT_LOC || message === WM_ERASEBKGND_LOC) {
+        if (emu.mainWindow) {
+          const main = emu.handles.get<WindowInfo>(emu.mainWindow);
+          if (main) main.needsPaint = true;
+        }
+        // Validate so the toolbar doesn't keep re-firing WM_PAINT
+        wnd.needsPaint = false;
+        return message === WM_ERASEBKGND_LOC ? 1 : 0;
+      }
+      const TB_ENABLEBUTTON       = 0x0401;
+      const TB_CHECKBUTTON        = 0x0402;
+      const TB_PRESSBUTTON        = 0x0403;
+      const TB_HIDEBUTTON         = 0x0404;
+      const TB_INDETERMINATE      = 0x0405;
+      const TB_ISBUTTONENABLED    = 0x0409;
+      const TB_ISBUTTONCHECKED    = 0x040A;
+      const TB_ISBUTTONPRESSED    = 0x040B;
+      const TB_ISBUTTONHIDDEN     = 0x040C;
+      const TB_ISBUTTONINDETERMINATE = 0x040D;
+      const TB_SETSTATE           = 0x0411;
+      const TB_GETSTATE           = 0x0412;
+      const TB_ADDBITMAP          = 0x0413;
+      const TB_ADDBUTTONS         = 0x0414;
+      const TB_INSERTBUTTON       = 0x0415;
+      const TB_DELETEBUTTON       = 0x0416;
+      const TB_GETBUTTON          = 0x0417;
+      const TB_BUTTONCOUNT        = 0x0418;
+      const TB_COMMANDTOINDEX     = 0x0419;
+      const TB_GETITEMRECT        = 0x041D;
+      const TB_BUTTONSTRUCTSIZE   = 0x041E;
+      const TB_SETBUTTONSIZE      = 0x041F;
+      const TB_SETBITMAPSIZE      = 0x0420;
+      const TB_AUTOSIZE           = 0x0421;
+      const TB_GETROWS            = 0x0428;
+      const TB_GETBITMAPFLAGS     = 0x0429;
+      const TB_SETCMDID           = 0x042A;
+      const TB_CHANGEBITMAP       = 0x042B;
+      const TB_GETBITMAP          = 0x042C;
+      const TB_SETINDENT          = 0x042F;
+      const TB_SETIMAGELIST       = 0x0430;
+      const TB_GETIMAGELIST       = 0x0431;
+      const TB_LOADIMAGES         = 0x0432;
+      const TB_GETRECT            = 0x0433;
+      const TB_SETHOTIMAGELIST    = 0x0434;
+      const TB_GETHOTIMAGELIST    = 0x0435;
+      const TB_SETDISABLEDIMAGELIST = 0x0436;
+      const TB_GETDISABLEDIMAGELIST = 0x0437;
+      const TB_SETSTYLE           = 0x0438;
+      const TB_GETSTYLE           = 0x0439;
+      const TB_GETBUTTONSIZE      = 0x043A;
+      const TB_SETBUTTONWIDTH     = 0x043B;
+      const TB_GETMAXSIZE         = 0x0453;
+      const TB_HITTEST            = 0x0445;
+      const TB_SETEXTENDEDSTYLE   = 0x0454;
+      const TB_GETEXTENDEDSTYLE   = 0x0455;
+
+      // Allocate per-toolbar state if needed
+      if (!wnd.tbButtons) wnd.tbButtons = [];
+
+      if (message === TB_BUTTONSTRUCTSIZE) { wnd.tbButtonStructSize = wParam; return 0; }
+      if (message === TB_ADDBUTTONS) {
+        const count = wParam | 0;
+        const size = wnd.tbButtonStructSize || 20;
+        for (let i = 0; i < count; i++) {
+          const base = lParam + i * size;
+          wnd.tbButtons.push({
+            iBitmap: emu.memory.readI32(base),
+            idCommand: emu.memory.readI32(base + 4),
+            fsState: emu.memory.readU8(base + 8),
+            fsStyle: emu.memory.readU8(base + 9),
+          });
+        }
+        return 1; // TRUE = success
+      }
+      if (message === TB_INSERTBUTTON) return 1;
+      if (message === TB_DELETEBUTTON) { wnd.tbButtons.splice(wParam, 1); return 1; }
+      if (message === TB_BUTTONCOUNT) return wnd.tbButtons.length;
+      if (message === TB_ADDBITMAP) {
+        // TBADDBITMAP at lParam: { HINSTANCE hInst; UINT_PTR nID; }
+        // When hInst is NULL or HINST_COMMCTRL (-1), nID is an HBITMAP we
+        // can render. Otherwise nID is a resource ID inside hInst — skip
+        // for now (most MFC apps pass NULL+HBITMAP).
+        if (lParam) {
+          const hInst = emu.memory.readU32(lParam);
+          const nID = emu.memory.readU32(lParam + 4);
+          if (!hInst && nID && !wnd.tbBitmapHandle) wnd.tbBitmapHandle = nID;
+        }
+        return 0; // bitmap index 0 (we currently render from a single sheet)
+      }
+      if (message === TB_LOADIMAGES) return 0;
+      if (message === TB_AUTOSIZE) return 0;
+      if (message === TB_SETBUTTONSIZE) { wnd.tbButtonSize = lParam; return 1; }
+      if (message === TB_SETBITMAPSIZE) { wnd.tbBitmapSize = lParam; return 1; }
+      if (message === TB_GETBUTTONSIZE) return wnd.tbButtonSize ?? ((22 << 16) | 24);
+      if (message === TB_GETROWS) return 1;
+      if (message === TB_GETSTYLE) return wnd.style >>> 0;
+      if (message === TB_SETSTYLE) { wnd.style = lParam >>> 0; return 0; }
+      if (message === TB_GETEXTENDEDSTYLE) return 0;
+      if (message === TB_SETEXTENDEDSTYLE) return 0;
+      if (message === TB_SETIMAGELIST) return 0;
+      if (message === TB_GETIMAGELIST) return 0;
+      if (message === TB_SETHOTIMAGELIST) return 0;
+      if (message === TB_GETHOTIMAGELIST) return 0;
+      if (message === TB_SETDISABLEDIMAGELIST) return 0;
+      if (message === TB_GETDISABLEDIMAGELIST) return 0;
+      if (message === TB_SETCMDID) return 1;
+      if (message === TB_SETINDENT) return 1;
+      if (message === TB_SETBUTTONWIDTH) return 1;
+      if (message === TB_GETBITMAP) return 0;
+      if (message === TB_GETBITMAPFLAGS) return 0;
+      if (message === TB_CHANGEBITMAP) return 1;
+      if (message === TB_HITTEST) {
+        // lParam -> POINT in client coords; returns the button index, or a
+        // negative value when the point is not on a button.
+        if (!lParam) return -1;
+        const px = emu.memory.readI32(lParam);
+        const py = emu.memory.readI32(lParam + 4);
+        const TBSTYLE_SEP_HT = 0x01;
+        for (let i = 0; i < wnd.tbButtons.length; i++) {
+          const r = toolbarItemRect(wnd, i);
+          if (r && px >= r.l && px < r.r && py >= r.t && py < r.b) {
+            return (wnd.tbButtons[i].fsStyle & TBSTYLE_SEP_HT) ? -1 : i;
+          }
+        }
+        return -1;
+      }
+      if (message === TB_COMMANDTOINDEX) {
+        const idx = wnd.tbButtons.findIndex(b => b.idCommand === wParam);
+        return idx;
+      }
+      if (message === TB_GETBUTTON) {
+        const btn = wnd.tbButtons[wParam];
+        if (!btn || !lParam) return 0;
+        emu.memory.writeI32(lParam, btn.iBitmap);
+        emu.memory.writeI32(lParam + 4, btn.idCommand);
+        emu.memory.writeU8(lParam + 8, btn.fsState);
+        emu.memory.writeU8(lParam + 9, btn.fsStyle);
+        return 1;
+      }
+      if (message === TB_GETSTATE) {
+        const idx = wnd.tbButtons.findIndex(b => b.idCommand === wParam);
+        return idx >= 0 ? wnd.tbButtons[idx].fsState : -1;
+      }
+      if (message === TB_SETSTATE) {
+        const idx = wnd.tbButtons.findIndex(b => b.idCommand === wParam);
+        if (idx >= 0) wnd.tbButtons[idx].fsState = lParam & 0xFF;
+        return 1;
+      }
+      if (message === TB_ENABLEBUTTON || message === TB_CHECKBUTTON || message === TB_PRESSBUTTON ||
+          message === TB_HIDEBUTTON || message === TB_INDETERMINATE) return 1;
+      if (message === TB_ISBUTTONENABLED || message === TB_ISBUTTONCHECKED || message === TB_ISBUTTONPRESSED ||
+          message === TB_ISBUTTONHIDDEN || message === TB_ISBUTTONINDETERMINATE) return 0;
+      if (message === TB_GETITEMRECT || message === TB_GETRECT) {
+        // TB_GETITEMRECT takes a button INDEX, TB_GETRECT a command ID. The
+        // rect must be the button's REAL position: MFC's CToolBar::OnToolHitTest
+        // walks every button with TB_GETITEMRECT + PtInRect to decide whether a
+        // click hit a button — a fixed (0,0,22,22) answer made every click past
+        // the first button look like toolbar-void, which starts a CDockContext
+        // toolbar DRAG (modal tracking loop that swallows the WM_LBUTTONUP).
+        const idx = message === TB_GETRECT
+          ? wnd.tbButtons.findIndex(b => b.idCommand === wParam)
+          : wParam;
+        const r = toolbarItemRect(wnd, idx);
+        if (!r || !lParam) return 0;
+        emu.memory.writeI32(lParam, r.l);
+        emu.memory.writeI32(lParam + 4, r.t);
+        emu.memory.writeI32(lParam + 8, r.r);
+        emu.memory.writeI32(lParam + 12, r.b);
+        return 1;
+      }
+      if (message === TB_GETMAXSIZE) {
+        if (lParam) {
+          emu.memory.writeI32(lParam, wnd.tbButtons.length * 22);
+          emu.memory.writeI32(lParam + 4, 22);
+        }
+        return 1;
+      }
+      // Catch-all for other TB_* messages — return 0 (most are queries that
+      // accept 0 as "don't know"; SET-style ops have already been handled above).
+      if (message >= 0x0400 && message < 0x0500) return 0;
+    }
+
     return null; // not handled — proceed to wndProc
   };
+
+  // Expose for DefWindowProcA: MFC's CToolBar::SetButtons (and similar control
+  // helpers) call DefWindowProc(TB_*, ...) directly instead of SendMessage,
+  // because they're already inside the control's wndProc and want to fall
+  // through to the original built-in behaviour. Our DefWindowProcA must
+  // therefore consult this dispatcher.
+  emu.dispatchBuiltinMessage = handleBuiltinMessage;
 
   user32.register('SendMessageA', 4, () => {
     const hwnd = emu.readArg(0);
@@ -2006,9 +2470,15 @@ export function registerMessage(emu: Emulator): void {
   user32.register('PostMessageW', 4, emu.apiDefs.get('USER32.DLL:PostMessageA')?.handler!);
 
   user32.register('PostThreadMessageW', 4, () => 1); // pretend success
+  user32.register('PostThreadMessageA', 4, () => 1);
 
   user32.register('GetMessageTime', 0, () => (Date.now() & 0xFFFFFFFF) >>> 0);
-  user32.register('GetMessagePos', 0, () => 0); // (0,0)
+  // GetMessagePos returns the screen-coords cursor position packed as
+  // LOWORD=x, HIWORD=y. Reuses emu.cursorX/Y maintained by mouse events
+  // and SetCursorPos.
+  user32.register('GetMessagePos', 0, () => {
+    return ((emu.cursorY & 0xFFFF) << 16) | (emu.cursorX & 0xFFFF);
+  });
 
   // DDE message functions
   user32.register('ReuseDDElParam', 5, () => {

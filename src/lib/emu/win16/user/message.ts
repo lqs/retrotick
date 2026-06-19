@@ -572,6 +572,11 @@ export function registerWin16UserMessage(emu: Emulator, user: Win16Module, h: Wi
           emu.memory.writeU32(lpMsg + 10, Date.now() & 0xFFFFFFFF);
           return 1;
         }
+        // Clear needsPaint at synthesis time to prevent an infinite WM_PAINT
+        // storm when the WndProc paints via GetDC instead of BeginPaint (legal
+        // in Win16). Mirrors win32 synthesizePaint(); BeginPaint also clears it
+        // for the well-behaved case.
+        wnd.needsPaint = false;
         emu.memory.writeU16(lpMsg, handle);
         emu.memory.writeU16(lpMsg + 2, 0x000F); // WM_PAINT
         emu.memory.writeU16(lpMsg + 4, 0);

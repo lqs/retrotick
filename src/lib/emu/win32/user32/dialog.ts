@@ -185,7 +185,7 @@ export function registerDialog(emu: Emulator): void {
       x: cascPos.x, y: cascPos.y, width, height,
       style: dlg.style, exStyle: dlg.exStyle,
       title: dlg.title, visible: false, hMenu: 0,
-      extraBytes: new Uint8Array(30), userData: 0,
+      extraBytes: new Uint8Array(30), userData: 0, ownerThreadId: emu.currentThread?.id,
       children: new Map<number, number>(),
       dlgProc,
     };
@@ -227,7 +227,7 @@ export function registerDialog(emu: Emulator): void {
         style: item.style, exStyle: item.exStyle,
         title: item.text, visible: true, hMenu: 0,
         extraBytes: new Uint8Array(Math.max(0, ctrlCls.cbWndExtra)),
-        userData: 0, controlId: item.id,
+        userData: 0, controlId: item.id, ownerThreadId: emu.currentThread?.id,
       };
       const childHwnd = emu.handles.alloc('window', childWnd);
       childWnd.hwnd = childHwnd;
@@ -601,7 +601,7 @@ export function registerDialog(emu: Emulator): void {
       x: cascPos.x, y: cascPos.y, width, height,
       style: dlg.style, exStyle: dlg.exStyle,
       title: dlg.title, visible: false, hMenu: 0,
-      extraBytes: new Uint8Array(cbExtra), userData: 0,
+      extraBytes: new Uint8Array(cbExtra), userData: 0, ownerThreadId: emu.currentThread?.id,
       children: new Map<number, number>(),
       dlgProc,
     };
@@ -650,7 +650,7 @@ export function registerDialog(emu: Emulator): void {
         style: item.style, exStyle: item.exStyle,
         title: item.text, visible: true, hMenu: 0,
         extraBytes: new Uint8Array(Math.max(0, ctrlCls.cbWndExtra)),
-        userData: 0, controlId: item.id,
+        userData: 0, controlId: item.id, ownerThreadId: emu.currentThread?.id,
       };
       const childHwnd = emu.handles.alloc('window', childWnd);
       childWnd.hwnd = childHwnd;
@@ -1042,7 +1042,7 @@ export function registerDialog(emu: Emulator): void {
       x: cascPos2.x, y: cascPos2.y, width, height,
       style: dlg.style, exStyle: dlg.exStyle,
       title: dlg.title, visible: false, hMenu: 0,
-      extraBytes: new Uint8Array(cbExtra), userData: 0,
+      extraBytes: new Uint8Array(cbExtra), userData: 0, ownerThreadId: emu.currentThread?.id,
       children: new Map<number, number>(),
       dlgProc,
     };
@@ -1088,7 +1088,7 @@ export function registerDialog(emu: Emulator): void {
         style: item.style, exStyle: item.exStyle,
         title: item.text, visible: true, hMenu: 0,
         extraBytes: new Uint8Array(Math.max(0, ctrlCls.cbWndExtra)),
-        userData: 0, controlId: item.id,
+        userData: 0, controlId: item.id, ownerThreadId: emu.currentThread?.id,
       };
       const childHwnd = emu.handles.alloc('window', childWnd);
       childWnd.hwnd = childHwnd;

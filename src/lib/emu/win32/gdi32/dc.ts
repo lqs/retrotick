@@ -1,5 +1,6 @@
 import type { Emulator } from '../../emulator';
 import type { DCInfo } from './types';
+import type { BitmapInfo } from './types';
 import { OPAQUE } from '../types';
 import { disableSmoothing } from './_helpers';
 
@@ -29,6 +30,17 @@ export function registerDC(emu: Emulator): void {
 
   gdi32.register('DeleteDC', 1, () => {
     const hdc = emu.readArg(0);
+    // In Windows, drawing into a memory DC writes directly into the selected
+    // bitmap (shared storage). Our DC keeps a working copy, so flush it back
+    // to the bitmap before destroying the DC — the app may re-select the
+    // bitmap into another DC later and expects the drawn content to persist.
+    const dc = emu.handles.get<DCInfo>(hdc);
+    if (dc && dc.selectedBitmap && dc.canvas !== emu.canvas) {
+      const bmp = emu.handles.get<BitmapInfo>(dc.selectedBitmap);
+      if (bmp && bmp.canvas && bmp.width === dc.canvas.width && bmp.height === dc.canvas.height) {
+        bmp.ctx.drawImage(dc.canvas, 0, 0);
+      }
+    }
     emu.handles.free(hdc);
     return 1;
   });

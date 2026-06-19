@@ -159,11 +159,16 @@ export function registerRegisterClass(emu: Emulator): void {
     }
     if (!cls) return 0;
 
-    // For built-in classes with wndProc=0, provide the DefWindowProc thunk
+    // For built-in classes with wndProc=0, provide the BUILTIN_WNDPROC thunk
+    // so a superclass's CallWindowProc reaches the built-in control behavior
+    // (combo/edit/listbox messages), falling back to DefWindowProc.
     let wndProc = cls.wndProc;
     if (!wndProc) {
-      const defProc = isWide ? 'USER32.DLL:DefWindowProcW' : 'USER32.DLL:DefWindowProcA';
-      wndProc = findThunkAddr(defProc);
+      wndProc = (isWide ? emu._builtinWndProcW : emu._builtinWndProcA) || 0;
+      if (!wndProc) {
+        const defProc = isWide ? 'USER32.DLL:DefWindowProcW' : 'USER32.DLL:DefWindowProcA';
+        wndProc = findThunkAddr(defProc);
+      }
     }
 
     // Write WNDCLASS structure (40 bytes): style, lpfnWndProc, cbClsExtra, cbWndExtra,

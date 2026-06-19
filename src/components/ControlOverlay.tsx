@@ -194,6 +194,21 @@ export function renderControlOverlay(
 
     // Ownerdraw — Button overlay for clicks + companion canvas on top for custom drawing
     if (bsType === 0xB) {
+      // Repaint the owner-drawn button so the app redraws it with the new
+      // ODS_SELECTED state. Modal dialogs use the dialog pump's
+      // _ownerDrawPending flag; modeless windows repaint via WM_PAINT.
+      const repaintOwnerDraw = (emu: NonNullable<typeof emuRef.current>) => {
+        const ds = emu.dialogState;
+        const dlgWnd = ds ? emu.handles.get<WindowInfo>(ds.hwnd) : null;
+        if (dlgWnd) {
+          dlgWnd._ownerDrawPending = true;
+        } else if (emu.mainWindow) {
+          const WM_PAINT = 0x000F;
+          const mainWnd = emu.handles.get<WindowInfo>(emu.mainWindow);
+          if (mainWnd) mainWnd.needsPaint = true;
+          emu.postMessage(emu.mainWindow, WM_PAINT, 0, 0);
+        }
+      };
       const onOwnerDrawMouseDown = (e: PointerEvent) => {
         if (isDisabled) return;
         e.preventDefault();
@@ -201,11 +216,9 @@ export function renderControlOverlay(
         // Send WM_DRAWITEM with ODS_SELECTED to show pressed state
         const emu = emuRef.current;
         if (emu) {
-          const ds = emu.dialogState;
-          const dlgWnd = ds ? emu.handles.get<WindowInfo>(ds.hwnd) : null;
-          if (dlgWnd) dlgWnd._ownerDrawPending = true;
           const childWnd = emu.handles.get<WindowInfo>(ctrl.childHwnd);
           if (childWnd) childWnd._odsSelected = true;
+          repaintOwnerDraw(emu);
         }
       };
       const onOwnerDrawMouseUp = () => {
@@ -215,6 +228,7 @@ export function renderControlOverlay(
         if (emu) {
           const childWnd = emu.handles.get<WindowInfo>(ctrl.childHwnd);
           if (childWnd) childWnd._odsSelected = false;
+          repaintOwnerDraw(emu);
         }
         postCommand();
       };

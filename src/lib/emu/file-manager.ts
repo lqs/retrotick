@@ -232,6 +232,12 @@ export class DefaultFileManager implements FileManager {
       const ext = this.externalFiles.get(upper);
       if (ext) return { name: ext.name, size: ext.data.length, source: 'external' };
     }
+    // Exact full-path match against additionalFiles works for any drive path
+    // (e.g. an exe at C:\ loading its bundled relative assets from C:\assets\...)
+    for (const [name, data] of additionalFiles) {
+      const nameNorm = name.toUpperCase().replace(/\//g, '\\');
+      if (nameNorm === upper) return { name, size: data.byteLength, source: 'additional' };
+    }
     if (upper.startsWith('D:\\')) {
       const relPath = upper.substring(3);
       if (relPath) {
@@ -443,6 +449,25 @@ export class DefaultFileManager implements FileManager {
         if (this.matchesPattern(fileName, filePat)) {
           const displayName = lastSep >= 0 ? name.substring(lastSep + 1) : name;
           results.push({ name: displayName, size: data.byteLength, isDir: false });
+        }
+      }
+    }
+
+    // Generic: additionalFiles keyed by full path (e.g. C:\GAME\LEVEL.DAT)
+    // match listings of their containing directory on any drive
+    {
+      const seen = new Set(results.map(e => e.name.toUpperCase()));
+      for (const [name, data] of additionalFiles) {
+        const nameNorm = name.toUpperCase().replace(/\//g, '\\');
+        const lastSep = nameNorm.lastIndexOf('\\');
+        if (lastSep < 0) continue;
+        const fileDir = nameNorm.substring(0, lastSep + 1);
+        const fileName = nameNorm.substring(lastSep + 1);
+        if (fileDir !== dirPart) continue;
+        if (seen.has(fileName)) continue;
+        seen.add(fileName);
+        if (this.matchesPattern(fileName, filePat)) {
+          results.push({ name: name.replace(/\//g, '\\').substring(lastSep + 1), size: data.byteLength, isDir: false });
         }
       }
     }

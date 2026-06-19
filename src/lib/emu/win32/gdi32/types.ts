@@ -46,6 +46,8 @@ export interface BitmapInfo {
   monochrome?: boolean;
   dibBitsPtr?: number;  // emulator memory address of DIB section pixel data
   dibBpp?: number;      // bits per pixel of DIB section
+  dibTopDown?: boolean; // DIB created with negative height (top-down row order)
+  dibColorTable?: number[]; // palette colors (0x00BBGGRR) for <=8bpp DIB sections
   dimX?: number;        // logical dimension set by SetBitmapDimension
   dimY?: number;        // logical dimension set by SetBitmapDimension
 }

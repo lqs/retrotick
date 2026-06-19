@@ -372,11 +372,87 @@ export function dcPutImageData(dc: DCInfo, imgData: ImageData, x: number, y: num
   dc.ctx.drawImage(tmp, x, y);
 }
 
-export function syncDCToCanvas(emu: Emulator, _hdc: number): void {
+export function syncDCToCanvas(emu: Emulator, hdc: number): void {
   // Window DCs draw directly to the main canvas — nothing to sync
   // Memory DCs are OffscreenCanvas which need explicit BitBlt
   // Mark screen as dirty so tick() can yield for browser rendering
   emu.screenDirty = true;
+  // DIB sections share pixel storage with the app: GDI drawing must be
+  // reflected back into the guest-visible pixel buffer.
+  const dc = emu.handles.get<DCInfo>(hdc);
+  if (dc) syncCanvasToDib(emu, dc);
+}
+
+/** Decode a DIB section's guest pixel buffer into the DC's working canvas.
+ *  Call before using a memory DC with a DIB section as a blt source —
+ *  the app may have written the pixels directly (shared-storage semantics). */
+export function syncDibToCanvas(emu: Emulator, dc: DCInfo): void {
+  const bmp = dc.selectedBitmap ? emu.handles.get<BitmapInfo>(dc.selectedBitmap) : null;
+  if (!bmp?.dibBitsPtr || !bmp.dibBpp) return;
+  const w = bmp.width, h = bmp.height, bpp = bmp.dibBpp;
+  if (dc.canvas.width !== w || dc.canvas.height !== h) return;
+  const stride = Math.floor((w * bpp + 31) / 32) * 4;
+  const raw = emu.memory.slice(bmp.dibBitsPtr, stride * h);
+  const img = dc.ctx.createImageData(w, h);
+  const px = img.data;
+  for (let y = 0; y < h; y++) {
+    const srcRow = (bmp.dibTopDown ? y : h - 1 - y) * stride;
+    let di = y * w * 4;
+    if (bpp === 32) {
+      for (let x = 0; x < w; x++) {
+        const si = srcRow + x * 4;
+        px[di] = raw[si + 2]; px[di + 1] = raw[si + 1]; px[di + 2] = raw[si]; px[di + 3] = 255;
+        di += 4;
+      }
+    } else if (bpp === 24) {
+      for (let x = 0; x < w; x++) {
+        const si = srcRow + x * 3;
+        px[di] = raw[si + 2]; px[di + 1] = raw[si + 1]; px[di + 2] = raw[si]; px[di + 3] = 255;
+        di += 4;
+      }
+    } else if (bpp === 8) {
+      const pal = bmp.dibColorTable || [];
+      for (let x = 0; x < w; x++) {
+        const c = pal[raw[srcRow + x]] || 0;
+        px[di] = (c >> 16) & 0xFF; px[di + 1] = (c >> 8) & 0xFF; px[di + 2] = c & 0xFF; px[di + 3] = 255;
+        di += 4;
+      }
+    } else {
+      return; // 1/4/16bpp DIB sections not handled yet
+    }
+  }
+  dc.ctx.putImageData(img, 0, 0);
+}
+
+/** Encode the DC's working canvas back into the DIB section's guest buffer. */
+export function syncCanvasToDib(emu: Emulator, dc: DCInfo): void {
+  const bmp = dc.selectedBitmap ? emu.handles.get<BitmapInfo>(dc.selectedBitmap) : null;
+  if (!bmp?.dibBitsPtr || !bmp.dibBpp) return;
+  const w = bmp.width, h = bmp.height, bpp = bmp.dibBpp;
+  if (bpp !== 24 && bpp !== 32) return;
+  if (dc.canvas.width !== w || dc.canvas.height !== h) return;
+  const stride = Math.floor((w * bpp + 31) / 32) * 4;
+  const img = dc.ctx.getImageData(0, 0, w, h);
+  const px = img.data;
+  const out = new Uint8Array(stride * h);
+  for (let y = 0; y < h; y++) {
+    const dstRow = (bmp.dibTopDown ? y : h - 1 - y) * stride;
+    let si = y * w * 4;
+    if (bpp === 32) {
+      for (let x = 0; x < w; x++) {
+        const di = dstRow + x * 4;
+        out[di] = px[si + 2]; out[di + 1] = px[si + 1]; out[di + 2] = px[si]; out[di + 3] = 255;
+        si += 4;
+      }
+    } else {
+      for (let x = 0; x < w; x++) {
+        const di = dstRow + x * 3;
+        out[di] = px[si + 2]; out[di + 1] = px[si + 1]; out[di + 2] = px[si];
+        si += 4;
+      }
+    }
+  }
+  emu.memory.copyFrom(bmp.dibBitsPtr, out);
 }
 
 // Dispatch to the next SEH handler in the chain

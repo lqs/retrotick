@@ -2,6 +2,7 @@ import type { Emulator } from '../emulator';
 import { formatString, scanString, stackArgReader, vaListArgReader } from '../format';
 import { emuCompleteThunk } from '../emu-exec';
 import { fpuPush } from '../x86/fpu';
+import { raiseSehException } from './kernel32/process';
 
 export function registerMsvcrt(emu: Emulator): void {
   const msvcrt = emu.registerDll('MSVCRT.DLL');
@@ -406,10 +407,126 @@ export function registerMsvcrt(emu: Emulator): void {
     emu.cpu.eip = retAddr;
     return undefined;
   });
-  msvcrt.register('__CxxFrameHandler', 0, () => 1); // ExceptionContinueSearch
+  // __CxxFrameHandler — MSVC x86 C++ exception frame handler (FH3 layout).
+  // Invoked via the function's __ehhandler stub which sets EAX = FuncInfo and
+  // jumps here. Stack: [ret][pExcRec][pRegNode][pCtx][pDispCtx].
+  //
+  // VC6 EH frame layout (matches _EH_prolog above):
+  //   regNode = EBP-0x0C:  [+0]=prev  [+4]=handler  [+8]=state(trylevel)
+  //   establisher EBP = regNode + 0x0C
+  //   saved ESP for catch continuation = [regNode-4] (EBP-0x10)
+  const EXCEPTION_CONTINUE_SEARCH = 1;
+  const STATUS_MSVC_CPP_EXCEPTION = 0xE06D7363;
+  const EH_UNWINDING = 0x2;
+  const MSVC_EH_MAGIC = 0x19930520;
+  const HT_BYREF = 0x8;
+
+  msvcrt.register('__CxxFrameHandler', 0, () => {
+    const excRec = emu.readArg(0);
+    const regNode = emu.readArg(1);
+    const funcInfo = emu.cpu.reg[0] >>> 0; // EAX set by the __ehhandler stub
+
+    const excCode = emu.memory.readU32(excRec) >>> 0;
+    const excFlags = emu.memory.readU32(excRec + 4);
+    if (excCode !== STATUS_MSVC_CPP_EXCEPTION) return EXCEPTION_CONTINUE_SEARCH;
+    if (excFlags & EH_UNWINDING) return EXCEPTION_CONTINUE_SEARCH;
+    if (!funcInfo || emu.memory.readU32(funcInfo) !== MSVC_EH_MAGIC) return EXCEPTION_CONTINUE_SEARCH;
+
+    const pExcObj = emu.memory.readU32(excRec + 0x18);
+    const pThrowInfo = emu.memory.readU32(excRec + 0x1C);
+
+    const curState = emu.memory.readI32(regNode + 8);
+    const nTryBlocks = emu.memory.readU32(funcInfo + 0x0C);
+    const pTryBlockMap = emu.memory.readU32(funcInfo + 0x10);
+    if (!nTryBlocks || !pTryBlockMap) return EXCEPTION_CONTINUE_SEARCH;
+
+    // Find the innermost try block containing the current state
+    // TryBlockMapEntry: { tryLow, tryHigh, catchHigh, nCatches, pHandlerArray } (20 bytes)
+    let tb = -1;
+    for (let i = 0; i < nTryBlocks; i++) {
+      const e = pTryBlockMap + i * 20;
+      const tryLow = emu.memory.readI32(e);
+      const tryHigh = emu.memory.readI32(e + 4);
+      if (curState >= tryLow && curState <= tryHigh) tb = e;
+    }
+    if (tb < 0) return EXCEPTION_CONTINUE_SEARCH;
+
+    const tryHigh = emu.memory.readI32(tb + 4);
+    const nCatches = emu.memory.readU32(tb + 12);
+    const pHandlerArray = emu.memory.readU32(tb + 16);
+    if (!nCatches || !pHandlerArray) return EXCEPTION_CONTINUE_SEARCH;
+
+    // Use the first catch handler. Full type matching against the throw's
+    // CatchableTypeArray is not implemented — single-catch try blocks
+    // (the overwhelmingly common case) behave identically.
+    // HandlerType: { adjectives, pType, dispCatchObj, addressOfHandler } (16 bytes)
+    const adjectives = emu.memory.readU32(pHandlerArray);
+    const dispCatchObj = emu.memory.readI32(pHandlerArray + 8);
+    const catchFunclet = emu.memory.readU32(pHandlerArray + 12);
+
+    const establisherEBP = (regNode + 0x0C) >>> 0;
+    console.log(`[SEH] __CxxFrameHandler: catch in frame ebp=0x${establisherEBP.toString(16)} state=${curState} funclet=0x${catchFunclet.toString(16)}`);
+
+    // Global unwind: cut the SEH chain down to this frame.
+    // (Intermediate handlers are not called with EH_UNWINDING — their local
+    // destructors are skipped, an accepted simplification.)
+    emu.memory.writeU32(emu.cpu.fsBase, regNode);
+
+    // Copy the exception object into the catch variable slot
+    if (dispCatchObj && pExcObj) {
+      if (adjectives & HT_BYREF) {
+        emu.memory.writeU32((establisherEBP + dispCatchObj) >>> 0, pExcObj);
+      } else {
+        let size = 4;
+        if (pThrowInfo) {
+          const cta = emu.memory.readU32(pThrowInfo + 0x0C);
+          if (cta && emu.memory.readU32(cta) > 0) {
+            const ct = emu.memory.readU32(cta + 4);
+            if (ct) size = emu.memory.readU32(ct + 0x14) || 4;
+          }
+        }
+        for (let i = 0; i < size; i++) {
+          emu.memory.writeU8((establisherEBP + dispCatchObj + i) >>> 0, emu.memory.readU8((pExcObj + i) >>> 0));
+        }
+      }
+    }
+
+    // Mark the frame as inside the catch
+    emu.memory.writeI32(regNode + 8, tryHigh + 1);
+
+    // Call the catch funclet with the establisher's EBP; it returns the
+    // continuation address in EAX.
+    const savedEBP = emu.cpu.reg[5];
+    emu.cpu.reg[5] = establisherEBP;
+    const continuation = emu.callCallback(catchFunclet, []);
+    if (continuation === undefined || continuation === 0) {
+      emu.cpu.reg[5] = savedEBP;
+      console.warn(`[SEH] __CxxFrameHandler: catch funclet returned no continuation`);
+      return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    // Resume at the continuation with the frame's saved ESP ([regNode-4])
+    const savedESP = emu.memory.readU32((regNode - 4) >>> 0);
+    emu.cpu.reg[4] = savedESP;
+    emu.cpu.reg[5] = establisherEBP;
+    emu.cpu.eip = continuation >>> 0;
+    emu._sehState = null;
+    console.log(`[SEH] __CxxFrameHandler: resuming at 0x${(continuation >>> 0).toString(16)} esp=0x${savedESP.toString(16)}`);
+    return undefined; // EIP/ESP set directly
+  });
+
+  // _CxxThrowException(pExceptionObject, pThrowInfo) — raise an SEH exception
+  // with the MSVC C++ code so __CxxFrameHandler frames can catch it.
   msvcrt.register('_CxxThrowException', 0, () => {
-    console.warn('[MSVCRT] _CxxThrowException called — ignoring');
-    return 0;
+    const pExcObj = emu.readArg(0);
+    const pThrowInfo = emu.readArg(1);
+    console.log(`[SEH] _CxxThrowException obj=0x${pExcObj.toString(16)} throwInfo=0x${pThrowInfo.toString(16)}`);
+    // Pop our cdecl return address; the throw never returns
+    const retAddr = emu.memory.readU32(emu.cpu.reg[4] >>> 0);
+    emu.cpu.reg[4] = (emu.cpu.reg[4] + 4) | 0;
+    const EXCEPTION_NONCONTINUABLE = 0x1;
+    return raiseSehException(emu, STATUS_MSVC_CPP_EXCEPTION, EXCEPTION_NONCONTINUABLE,
+      [MSVC_EH_MAGIC, pExcObj, pThrowInfo], retAddr);
   });
   // operator delete(void*)
   msvcrt.register('??3@YAXPAX@Z', 0, () => {

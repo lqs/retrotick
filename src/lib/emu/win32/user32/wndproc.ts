@@ -99,12 +99,16 @@ export function registerWndProc(emu: Emulator): void {
       case WM_ERASEBKGND: {
         const wnd = emu.handles.get<WindowInfo>(hwnd);
         if (wnd) {
+          // NULL class background brush: the window manages its own background.
+          // DefWindowProc must not erase and must return 0 (per MSDN).
+          const hBrush = wnd.classInfo.hbrBackground;
+          if (!hBrush) return 0;
+          const brush = emu.getBrush(hBrush);
+          if (brush?.isNull) return 0;
           const hdc = wParam;
           const dc = emu.getDC(hdc);
           if (dc) {
-            const hBrush = wnd.classInfo.hbrBackground;
-            const brush = hBrush ? emu.getBrush(hBrush) : null;
-            const bgColor = (brush && !brush.isNull) ? brush.color : SYS_COLORS[COLOR_BTNFACE];
+            const bgColor = brush ? brush.color : SYS_COLORS[COLOR_BTNFACE];
             const r = bgColor & 0xFF;
             const g = (bgColor >> 8) & 0xFF;
             const b = (bgColor >> 16) & 0xFF;

@@ -3,6 +3,72 @@ import { initThreadTEB } from '../../emu-thunks-pe';
 
 const IMAGE_SUBSYSTEM_WINDOWS_CUI = 3;
 
+/** Build EXCEPTION_RECORD + CONTEXT and dispatch to the SEH handler chain.
+ *  The caller must already have popped its own thunk frame off the stack;
+ *  retAddr is the address the raising call would have returned to. */
+export function raiseSehException(
+  emu: Emulator, excCode: number, excFlags: number, params: number[], retAddr: number,
+): undefined {
+  // Build EXCEPTION_RECORD on heap (80 bytes = 0x50)
+  const excRec = emu.allocHeap(0x50);
+  emu.memory.writeU32(excRec + 0x00, excCode);       // ExceptionCode
+  emu.memory.writeU32(excRec + 0x04, excFlags);       // ExceptionFlags
+  emu.memory.writeU32(excRec + 0x08, 0);              // ExceptionRecord (chained, NULL)
+  emu.memory.writeU32(excRec + 0x0C, retAddr);        // ExceptionAddress
+  const numParams = Math.min(params.length, 15);
+  emu.memory.writeU32(excRec + 0x10, numParams);      // NumberParameters
+  for (let i = 0; i < numParams; i++) {
+    emu.memory.writeU32(excRec + 0x14 + i * 4, params[i]);
+  }
+
+  // Build CONTEXT on heap (0x2CC bytes)
+  const ctx = emu.allocHeap(0x2CC);
+  emu.memory.writeU32(ctx + 0x00, 0x10007);           // ContextFlags = CONTEXT_FULL
+  // Segment registers
+  emu.memory.writeU32(ctx + 0x8C, 0);                 // SegGs
+  emu.memory.writeU32(ctx + 0x90, 0x3B);              // SegFs
+  emu.memory.writeU32(ctx + 0x94, 0x23);              // SegEs
+  emu.memory.writeU32(ctx + 0x98, 0x23);              // SegDs
+  // Integer registers
+  emu.memory.writeU32(ctx + 0x9C, (emu.cpu.reg[7] >>> 0)); // EDI
+  emu.memory.writeU32(ctx + 0xA0, (emu.cpu.reg[6] >>> 0)); // ESI
+  emu.memory.writeU32(ctx + 0xA4, (emu.cpu.reg[3] >>> 0)); // EBX
+  emu.memory.writeU32(ctx + 0xA8, (emu.cpu.reg[2] >>> 0)); // EDX
+  emu.memory.writeU32(ctx + 0xAC, (emu.cpu.reg[1] >>> 0)); // ECX
+  emu.memory.writeU32(ctx + 0xB0, (emu.cpu.reg[0] >>> 0)); // EAX
+  // Control registers
+  emu.memory.writeU32(ctx + 0xB4, (emu.cpu.reg[5] >>> 0)); // EBP
+  emu.memory.writeU32(ctx + 0xB8, retAddr);                 // EIP (caller's address)
+  emu.memory.writeU32(ctx + 0xBC, 0x1B);                    // SegCs
+  emu.memory.writeU32(ctx + 0xC0, emu.cpu.getFlags());      // EFlags
+  emu.memory.writeU32(ctx + 0xC4, (emu.cpu.reg[4] >>> 0));  // ESP (after cleanup)
+  emu.memory.writeU32(ctx + 0xC8, 0x23);                    // SegSs
+
+  // Allocate DispatcherContext (just needs to exist, can be zeroed)
+  const dispCtx = emu.allocHeap(4);
+
+  // Read SEH chain head from FS:[0]
+  const firstReg = emu.memory.readU32((emu.cpu.fsBase + 0) >>> 0);
+
+  if (firstReg === 0xFFFFFFFF || firstReg === 0) {
+    console.error(`[SEH] No exception handler installed! ExceptionCode=0x${excCode.toString(16)}`);
+    emu.halted = true;
+    return undefined;
+  }
+
+  // Save SEH dispatch state
+  emu._sehState = {
+    excRecAddr: excRec,
+    ctxAddr: ctx,
+    currentReg: firstReg,
+    dispCtxAddr: dispCtx,
+  };
+
+  // Dispatch to the first handler in the chain
+  emu.dispatchToSehHandler(firstReg);
+  return undefined;
+}
+
 /** Check if an exe buffer is a console (CUI) subsystem app */
 function isConsoleExe(data: ArrayBuffer): boolean {
   const view = new DataView(data);
@@ -105,65 +171,12 @@ export function registerProcess(emu: Emulator): void {
     // Manually clean up the thunk frame: pop retAddr + 4 stdcall args
     emu.cpu.reg[4] = (emu.cpu.reg[4] + 20) | 0;
 
-    // Build EXCEPTION_RECORD on heap (80 bytes = 0x50)
-    const excRec = emu.allocHeap(0x50);
-    emu.memory.writeU32(excRec + 0x00, excCode);       // ExceptionCode
-    emu.memory.writeU32(excRec + 0x04, excFlags);       // ExceptionFlags
-    emu.memory.writeU32(excRec + 0x08, 0);              // ExceptionRecord (chained, NULL)
-    emu.memory.writeU32(excRec + 0x0C, retAddr);        // ExceptionAddress
+    const params: number[] = [];
     const numParams = Math.min(nArgs, 15);
-    emu.memory.writeU32(excRec + 0x10, numParams);      // NumberParameters
     for (let i = 0; i < numParams; i++) {
-      const val = lpArgs ? emu.memory.readU32((lpArgs + i * 4) >>> 0) : 0;
-      emu.memory.writeU32(excRec + 0x14 + i * 4, val);
+      params.push(lpArgs ? emu.memory.readU32((lpArgs + i * 4) >>> 0) : 0);
     }
-
-    // Build CONTEXT on heap (0x2CC bytes)
-    const ctx = emu.allocHeap(0x2CC);
-    emu.memory.writeU32(ctx + 0x00, 0x10007);           // ContextFlags = CONTEXT_FULL
-    // Segment registers
-    emu.memory.writeU32(ctx + 0x8C, 0);                 // SegGs
-    emu.memory.writeU32(ctx + 0x90, 0x3B);              // SegFs
-    emu.memory.writeU32(ctx + 0x94, 0x23);              // SegEs
-    emu.memory.writeU32(ctx + 0x98, 0x23);              // SegDs
-    // Integer registers
-    emu.memory.writeU32(ctx + 0x9C, (emu.cpu.reg[7] >>> 0)); // EDI
-    emu.memory.writeU32(ctx + 0xA0, (emu.cpu.reg[6] >>> 0)); // ESI
-    emu.memory.writeU32(ctx + 0xA4, (emu.cpu.reg[3] >>> 0)); // EBX
-    emu.memory.writeU32(ctx + 0xA8, (emu.cpu.reg[2] >>> 0)); // EDX
-    emu.memory.writeU32(ctx + 0xAC, (emu.cpu.reg[1] >>> 0)); // ECX
-    emu.memory.writeU32(ctx + 0xB0, (emu.cpu.reg[0] >>> 0)); // EAX
-    // Control registers
-    emu.memory.writeU32(ctx + 0xB4, (emu.cpu.reg[5] >>> 0)); // EBP
-    emu.memory.writeU32(ctx + 0xB8, retAddr);                 // EIP (caller's address)
-    emu.memory.writeU32(ctx + 0xBC, 0x1B);                    // SegCs
-    emu.memory.writeU32(ctx + 0xC0, emu.cpu.getFlags());      // EFlags
-    emu.memory.writeU32(ctx + 0xC4, (emu.cpu.reg[4] >>> 0));  // ESP (after cleanup)
-    emu.memory.writeU32(ctx + 0xC8, 0x23);                    // SegSs
-
-    // Allocate DispatcherContext (just needs to exist, can be zeroed)
-    const dispCtx = emu.allocHeap(4);
-
-    // Read SEH chain head from FS:[0]
-    const firstReg = emu.memory.readU32((emu.cpu.fsBase + 0) >>> 0);
-
-    if (firstReg === 0xFFFFFFFF || firstReg === 0) {
-      console.error(`[SEH] No exception handler installed! ExceptionCode=0x${excCode.toString(16)}`);
-      emu.halted = true;
-      return undefined;
-    }
-
-    // Save SEH dispatch state
-    emu._sehState = {
-      excRecAddr: excRec,
-      ctxAddr: ctx,
-      currentReg: firstReg,
-      dispCtxAddr: dispCtx,
-    };
-
-    // Dispatch to the first handler in the chain
-    emu.dispatchToSehHandler(firstReg);
-    return undefined;
+    return raiseSehException(emu, excCode, excFlags, params, retAddr);
   });
 
   // RtlUnwind — unwind the SEH chain to a target frame
@@ -323,6 +336,13 @@ export function registerProcess(emu: Emulator): void {
       if (next) {
         emu.switchToThread(next);
         return undefined; // skip thunk completion — we switched threads
+      }
+      // Threads blocked in GetMessage/Sleep are still alive — switch to one
+      // and idle until its async resume fires.
+      const waiter = emu.threads.find(t => !t.exited && t !== emu.currentThread);
+      if (waiter) {
+        emu.switchToThread(waiter);
+        return undefined;
       }
     }
     // Last thread — halt

@@ -281,18 +281,15 @@ export function registerText(emu: Emulator): void {
     const hasPrefix = !(format & DT_NOPREFIX);
 
     if (!(format & DT_CALCRECT)) {
-      if (dc.bkMode === OPAQUE) {
-        const br = dc.bkColor & 0xFF;
-        const bg = (dc.bkColor >> 8) & 0xFF;
-        const bb = (dc.bkColor >> 16) & 0xFF;
-        dc.ctx.fillStyle = `rgb(${br},${bg},${bb})`;
-        dc.ctx.fillRect(left, top, right - left, bottom - top);
-      }
+      // OPAQUE fills only each text line's character cell, never the whole rect
+      const opaque = dc.bkMode === OPAQUE;
+      const bkCSS = `rgb(${dc.bkColor & 0xFF},${(dc.bkColor >> 8) & 0xFF},${(dc.bkColor >> 16) & 0xFF})`;
 
       const r = dc.textColor & 0xFF;
       const g = (dc.textColor >> 8) & 0xFF;
       const b = (dc.textColor >> 16) & 0xFF;
-      dc.ctx.fillStyle = `rgb(${r},${g},${b})`;
+      const textCSS = `rgb(${r},${g},${b})`;
+      dc.ctx.fillStyle = textCSS;
       dc.ctx.font = fontCSS;
       dc.ctx.textBaseline = 'top';
 
@@ -314,6 +311,13 @@ export function registerText(emu: Emulator): void {
       }
       for (const line of lines) {
         if (y + lineH > bottom && !(format & DT_SINGLELINE)) break;
+        if (opaque) {
+          const w = dc.ctx.measureText(line).width;
+          const lx = (format & DT_CENTER) ? x - w / 2 : (format & DT_RIGHT) ? x - w : x;
+          dc.ctx.fillStyle = bkCSS;
+          dc.ctx.fillRect(lx, y, w, lineH);
+          dc.ctx.fillStyle = textCSS;
+        }
         fillTextWithPrefix(dc.ctx, line, x, y, right - left, hasPrefix, fontSize);
         y += lineH;
       }
@@ -388,18 +392,16 @@ export function registerText(emu: Emulator): void {
       return totalH;
     }
 
-    if (dc.bkMode === OPAQUE) {
-      const br = dc.bkColor & 0xFF;
-      const bg = (dc.bkColor >> 8) & 0xFF;
-      const bb = (dc.bkColor >> 16) & 0xFF;
-      dc.ctx.fillStyle = `rgb(${br},${bg},${bb})`;
-      dc.ctx.fillRect(left, top, right - left, bottom - top);
-    }
+    // OPAQUE background mode fills only each text line's character cell
+    // (like TextOut), never the whole rect — DrawText has no rect-fill behavior.
+    const opaque = dc.bkMode === OPAQUE;
+    const bkCSS = `rgb(${dc.bkColor & 0xFF},${(dc.bkColor >> 8) & 0xFF},${(dc.bkColor >> 16) & 0xFF})`;
 
     const r = dc.textColor & 0xFF;
     const g = (dc.textColor >> 8) & 0xFF;
     const b = (dc.textColor >> 16) & 0xFF;
-    dc.ctx.fillStyle = `rgb(${r},${g},${b})`;
+    const textCSS = `rgb(${r},${g},${b})`;
+    dc.ctx.fillStyle = textCSS;
     dc.ctx.font = fontCSS;
     dc.ctx.textBaseline = 'top';
 
@@ -423,6 +425,13 @@ export function registerText(emu: Emulator): void {
       // Skip lines that start below the rect — but always draw the first line
       // (Windows draws oversized text and clips visually, never skips it entirely)
       if (li > 0 && y >= bottom && !(format & DT_SINGLELINE)) break;
+      if (opaque) {
+        const w = dc.ctx.measureText(lines[li]).width;
+        const lx = (format & DT_CENTER) ? x - w / 2 : (format & DT_RIGHT) ? x - w : x;
+        dc.ctx.fillStyle = bkCSS;
+        dc.ctx.fillRect(lx, y, w, lineH);
+        dc.ctx.fillStyle = textCSS;
+      }
       fillTextWithPrefix(dc.ctx, lines[li], x, y, right - left, hasPrefix, fontSize);
       y += lineH;
     }

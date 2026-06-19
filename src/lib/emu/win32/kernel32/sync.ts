@@ -46,25 +46,46 @@ export function registerSync(emu: Emulator): void {
   });
 
   // Events
-  kernel32.register('CreateEventA', 4, () => emu.handles.alloc('event', { signaled: false }));
-  kernel32.register('CreateEventW', 4, () => emu.handles.alloc('event', { signaled: false }));
+  interface EventInfo {
+    signaled: boolean;
+    manualReset?: boolean;
+    waiters?: Array<() => void>;
+  }
+  const createEvent = () => {
+    const manualReset = !!emu.readArg(1);
+    const initialState = !!emu.readArg(2);
+    return emu.handles.alloc('event', { signaled: initialState, manualReset } as EventInfo);
+  };
+  kernel32.register('CreateEventA', 4, createEvent);
+  kernel32.register('CreateEventW', 4, createEvent);
   kernel32.register('ResetEvent', 1, () => {
     const h = emu.readArg(0);
-    const ev = emu.handles.get<{ signaled: boolean }>(h);
+    const ev = emu.handles.get<EventInfo>(h);
     if (ev) ev.signaled = false;
     return 1;
   });
   kernel32.register('SetEvent', 1, () => {
     const h = emu.readArg(0);
-    const ev = emu.handles.get<{ signaled: boolean }>(h);
-    if (ev) ev.signaled = true;
+    const ev = emu.handles.get<EventInfo>(h);
+    if (ev) {
+      ev.signaled = true;
+      // Wake waiters asynchronously — we are executing inside a thunk handler
+      // on the signaling thread; the waiter's resume must not run (and switch
+      // threads) until this handler has completed.
+      if (ev.waiters && ev.waiters.length > 0) {
+        const toWake = ev.manualReset ? ev.waiters.splice(0) : ev.waiters.splice(0, 1);
+        for (const w of toWake) setTimeout(w, 0);
+      }
+    }
     return 1;
   });
   const STD_INPUT_HANDLE = 0xFFFFFFF6;
   const WAIT_OBJECT_0 = 0;
   const WAIT_TIMEOUT = 0x102;
+  const INFINITE = 0xFFFFFFFF;
   kernel32.register('WaitForSingleObject', 2, () => {
     const hHandle = emu.readArg(0);
+    const timeout = emu.readArg(1) >>> 0;
     // If waiting on stdin and no input available, wait
     if (hHandle === (STD_INPUT_HANDLE >>> 0) && emu.consoleInputBuffer.length === 0) {
       const stackBytes = emu._currentThunkStackBytes;
@@ -73,7 +94,7 @@ export function registerSync(emu: Emulator): void {
       return undefined;
     }
     // Check handle state
-    const obj = emu.handles.get<{ signaled?: boolean; childEmu?: unknown; childExited?: boolean }>(hHandle);
+    const obj = emu.handles.get<EventInfo & { childEmu?: unknown; childExited?: boolean }>(hHandle);
     // Child process handle — block until child exits
     if (obj && obj.childEmu !== undefined) {
       if (obj.childExited) return WAIT_OBJECT_0;
@@ -84,10 +105,37 @@ export function registerSync(emu: Emulator): void {
       emu.waitingForMessage = true;
       return undefined;
     }
-    // Check event state
+    // Event: block until signaled or timeout (real Windows semantics)
     if (obj && obj.signaled !== undefined) {
-      if (obj.signaled) { obj.signaled = false; return WAIT_OBJECT_0; }
-      return WAIT_TIMEOUT;
+      if (obj.signaled) {
+        if (!obj.manualReset) obj.signaled = false;
+        return WAIT_OBJECT_0;
+      }
+      if (timeout === 0) return WAIT_TIMEOUT;
+
+      const stackBytes = emu._currentThunkStackBytes;
+      emu.waitingForMessage = true;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+      const complete = (result: number) => {
+        emu.waitingForMessage = false;
+        emuCompleteThunk(emu, result, stackBytes);
+        if (emu.running && !emu.halted) requestAnimationFrame(emu.tick);
+      };
+      const onSignal = emu.captureThreadResume(() => {
+        if (timer !== null) clearTimeout(timer);
+        if (!obj.manualReset) obj.signaled = false;
+        complete(WAIT_OBJECT_0);
+      });
+      if (!obj.waiters) obj.waiters = [];
+      obj.waiters.push(onSignal);
+      if (timeout !== INFINITE) {
+        timer = setTimeout(emu.captureThreadResume(() => {
+          const i = obj.waiters!.indexOf(onSignal);
+          if (i >= 0) obj.waiters!.splice(i, 1);
+          complete(WAIT_TIMEOUT);
+        }), timeout);
+      }
+      return undefined;
     }
     return WAIT_OBJECT_0;
   });
@@ -113,13 +161,13 @@ export function registerSync(emu: Emulator): void {
     if (dwMilliseconds === 0) return 0; // yield — return immediately
     const stackBytes = emu._currentThunkStackBytes;
     emu.waitingForMessage = true;
-    setTimeout(() => {
+    setTimeout(emu.captureThreadResume(() => {
       emu.waitingForMessage = false;
       emuCompleteThunk(emu, 0, stackBytes);
       if (emu.running && !emu.halted) {
         requestAnimationFrame(emu.tick);
       }
-    }, dwMilliseconds);
+    }), dwMilliseconds);
     return undefined;
   });
 

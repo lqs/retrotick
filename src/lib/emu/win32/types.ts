@@ -44,6 +44,12 @@ export const WM_INITMENU = 0x0116;
 export const WM_INITMENUPOPUP = 0x0117;
 export const WM_MENUSELECT = 0x011F;
 export const WM_ENTERIDLE = 0x0121;
+export const WM_CTLCOLOREDIT = 0x0133;
+export const WM_CTLCOLORLISTBOX = 0x0134;
+export const WM_CTLCOLORBTN = 0x0135;
+export const WM_CTLCOLORDLG = 0x0136;
+export const WM_CTLCOLORSCROLLBAR = 0x0137;
+export const WM_CTLCOLORSTATIC = 0x0138;
 export const WM_MOUSEMOVE = 0x0200;
 export const WM_LBUTTONDOWN = 0x0201;
 export const WM_LBUTTONUP = 0x0202;
@@ -116,6 +122,8 @@ export const PATPAINT = 0x00FB0A09;
 export const PATINVERT = 0x005A0049;
 export const BLACKNESS = 0x00000042;
 export const WHITENESS = 0x00FF0062;
+export const DSNA = 0x00220326;      // dst = dst AND NOT src ("DSna")
+export const PSDPXAX = 0x00B8074A;   // dst = pat XOR (dst AND (pat XOR src)) ("PSDPxax")
 
 // System colors
 export const COLOR_SCROLLBAR = 0;
@@ -217,6 +225,14 @@ export const SM_CYVIRTUALSCREEN = 79;
 export const TRANSPARENT = 1;
 export const OPAQUE = 2;
 
+// Owner-draw constants (DRAWITEMSTRUCT)
+export const ODT_BUTTON = 4;
+export const ODA_DRAWENTIRE = 0x1;
+export const ODA_SELECT = 0x2;
+export const ODA_FOCUS = 0x4;
+export const ODS_SELECTED = 0x0001;
+export const ODS_DISABLED = 0x0004;
+
 // MK flags for mouse messages
 export const MK_LBUTTON = 0x0001;
 export const MK_RBUTTON = 0x0002;
@@ -270,6 +286,9 @@ export const HTCLIENT = 1;
 
 // GDI object types (for GetObjectA)
 export const OBJ_BITMAP = 7;
+
+// CBT hook codes (WH_CBT)
+export const HCBT_CREATEWND = 3;
 
 // Misc
 export const CW_USEDEFAULT = 0x80000000;

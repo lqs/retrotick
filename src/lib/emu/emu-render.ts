@@ -3,8 +3,10 @@ import type { WindowInfo } from './win32/user32/index';
 import type { BrushInfo } from './win32/gdi32/types';
 import { renderButton, renderStatic, renderEdit } from './emu-render-controls';
 import { getNonClientMetrics } from './win32/user32/_helpers';
-
-const WM_CTLCOLORSTATIC = 0x0138;
+import {
+  WM_CTLCOLORSTATIC, WM_CTLCOLORBTN, SYS_COLORS, COLOR_BTNFACE, COLOR_BTNTEXT,
+  ODT_BUTTON, ODA_DRAWENTIRE, ODS_SELECTED, ODS_DISABLED,
+} from './win32/types';
 
 /** Send WM_CTLCOLORSTATIC to parent and return CSS color string if a valid brush is returned */
 function getCtlColorStatic(emu: Emulator, child: WindowInfo, childHwnd: number): string | undefined {
@@ -272,11 +274,26 @@ function sendDrawItem(emu: Emulator, parentHwnd: number, parentWnd: WindowInfo, 
     dc.ctx.translate(child.x, child.y);
   }
 
-  emu.memory.writeU32(addr + 0,  4);           // CtlType = ODT_BUTTON
+  // Windows prepares the DC via WM_CTLCOLORBTN before WM_DRAWITEM:
+  // the default (DefWindowProc) sets bk=COLOR_BTNFACE, text=COLOR_BTNTEXT,
+  // then the parent may override with its own SetBkColor/SetTextColor.
+  if (dc) {
+    dc.bkColor = SYS_COLORS[COLOR_BTNFACE];
+    dc.textColor = SYS_COLORS[COLOR_BTNTEXT];
+    if (!emu.isNE && parentWnd.wndProc) {
+      emu.callWndProc(parentWnd.wndProc, parentHwnd, WM_CTLCOLORBTN, hdc, childHwnd);
+    }
+  }
+
+  let itemState = 0;
+  if (child.style & 0x08000000) itemState |= ODS_DISABLED; // WS_DISABLED
+  if (child._odsSelected) itemState |= ODS_SELECTED;       // pressed state
+
+  emu.memory.writeU32(addr + 0,  ODT_BUTTON);  // CtlType
   emu.memory.writeU32(addr + 4,  controlId);   // CtlID
   emu.memory.writeU32(addr + 8,  0);           // itemID
-  emu.memory.writeU32(addr + 12, 1);           // itemAction = ODA_DRAWENTIRE
-  emu.memory.writeU32(addr + 16, (child.style & 0x08000000) ? 0x4 : 0); // itemState: ODS_DISABLED if WS_DISABLED
+  emu.memory.writeU32(addr + 12, ODA_DRAWENTIRE); // itemAction
+  emu.memory.writeU32(addr + 16, itemState);   // itemState
   emu.memory.writeU32(addr + 20, childHwnd);   // hwndItem
   emu.memory.writeU32(addr + 24, hdc);         // hDC
   emu.memory.writeU32(addr + 28, 0);           // rcItem.left
@@ -289,11 +306,11 @@ function sendDrawItem(emu: Emulator, parentHwnd: number, parentWnd: WindowInfo, 
     // Win16 DRAWITEMSTRUCT uses 16-bit fields; build a 16-bit version
     // Layout: CtlType(2) CtlID(2) itemID(2) itemAction(2) itemState(2) hwndItem(2) hDC(2) rcItem(8=4x2) itemData(4)
     const addr16 = emu.drawItemStructAddr;
-    emu.memory.writeU16(addr16 + 0,  4);           // CtlType = ODT_BUTTON
+    emu.memory.writeU16(addr16 + 0,  ODT_BUTTON);  // CtlType
     emu.memory.writeU16(addr16 + 2,  controlId);   // CtlID
     emu.memory.writeU16(addr16 + 4,  0);           // itemID
-    emu.memory.writeU16(addr16 + 6,  1);           // itemAction = ODA_DRAWENTIRE
-    emu.memory.writeU16(addr16 + 8,  (child.style & 0x08000000) ? 0x4 : 0); // itemState
+    emu.memory.writeU16(addr16 + 6,  ODA_DRAWENTIRE); // itemAction
+    emu.memory.writeU16(addr16 + 8,  itemState);   // itemState
     emu.memory.writeU16(addr16 + 10, childHwnd);   // hwndItem
     emu.memory.writeU16(addr16 + 12, hdc);         // hDC
     emu.memory.writeU16(addr16 + 14, 0);           // rcItem.left

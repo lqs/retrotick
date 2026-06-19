@@ -6,7 +6,7 @@ import {
   WM_CREATE, WM_NCCREATE, WM_NCCALCSIZE, WM_SHOWWINDOW,
   WM_SIZE, WM_ACTIVATE, WM_ACTIVATEAPP, WM_ERASEBKGND, WM_PAINT, WM_DESTROY,
   WM_NCDESTROY, WM_WINDOWPOSCHANGED,
-  CW_USEDEFAULT,
+  CW_USEDEFAULT, HCBT_CREATEWND,
 } from '../types';
 
 export function registerCreateWindow(emu: Emulator): void {
@@ -139,14 +139,15 @@ export function registerCreateWindow(emu: Emulator): void {
     emu.memory.writeU32(createStructAddr + 40, classNamePtr);
     emu.memory.writeU32(createStructAddr + 44, exStyle);
 
-    // Fire CBT hooks (HCBT_CREATEWND = 3) before WM_NCCREATE
+    // Fire CBT hooks before WM_NCCREATE
     // CBT_CREATEWND: { CREATESTRUCT* lpcs; HWND hwndInsertAfter; }
+    // CBTProc is a 3-arg stdcall: (nCode, wParam, lParam)
     if (emu.cbtHooks.length > 0) {
       const cbtStruct = emu.allocHeap(8);
       emu.memory.writeU32(cbtStruct, createStructAddr);
       emu.memory.writeU32(cbtStruct + 4, 0); // hwndInsertAfter
       for (const hook of emu.cbtHooks) {
-        emu.callWndProc(hook.lpfn, 3, hwnd, cbtStruct, 0);
+        emu.callCallback(hook.lpfn, [HCBT_CREATEWND, hwnd, cbtStruct]);
       }
     }
 
@@ -275,13 +276,13 @@ export function registerCreateWindow(emu: Emulator): void {
     emu.memory.writeU32(createStructAddr + 40, classNamePtr);
     emu.memory.writeU32(createStructAddr + 44, exStyle);
 
-    // Fire CBT hooks (HCBT_CREATEWND = 3) before WM_NCCREATE
+    // Fire CBT hooks before WM_NCCREATE (CBTProc is a 3-arg stdcall)
     if (emu.cbtHooks.length > 0) {
       const cbtStruct = emu.allocHeap(8);
       emu.memory.writeU32(cbtStruct, createStructAddr);
       emu.memory.writeU32(cbtStruct + 4, 0);
       for (const hook of emu.cbtHooks) {
-        emu.callWndProc(hook.lpfn, 3, hwnd, cbtStruct, 0);
+        emu.callCallback(hook.lpfn, [HCBT_CREATEWND, hwnd, cbtStruct]);
       }
     }
 

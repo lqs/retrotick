@@ -720,6 +720,14 @@ export class Emulator {
   findState?: { term: string; lastIndex: number };
   // Exposed from wndproc.ts for RegisterWindowMessage dedup
   registerWindowMessage?: (name: string) => number;
+  // Exposed from message.ts: built-in control message handler + callable
+  // wndProc thunks for built-in classes (superclassing via GetClassInfo)
+  _handleBuiltinMessage?: (hwnd: number, message: number, wParam: number, lParam: number, wide?: boolean) => number | null;
+  _builtinWndProcA = 0;
+  _builtinWndProcW = 0;
+  // Per-tick budget for synthesized WM_PAINT messages (animation busy-loops
+  // must yield to the browser between frames)
+  _paintSynthBudget = 0;
   // Active FINDREPLACEW struct pointer for FindTextW/ReplaceTextW
   findReplacePtr = 0;
   // GL sync-yield guard: avoid double-yield when apps call both glFinish and SwapBuffers per frame.
@@ -1248,14 +1256,17 @@ export class Emulator {
   }
 
   postMessage(hwnd: number, message: number, wParam: number, lParam: number): void {
-    // Route to the thread that owns the target window
+    // Route to the thread that owns the target window. Windows delivers
+    // window messages to the creating (UI) thread's queue — never to whichever
+    // thread happens to be scheduled. Windows without a recorded owner belong
+    // to the main (first) thread.
     let targetThread = this.currentThread;
     if (hwnd && this.threads.length > 1) {
       const wnd = this.handles.get<WindowInfo>(hwnd);
-      if (wnd?.ownerThreadId) {
-        const ownerThread = this.threads.find(t => t.id === wnd.ownerThreadId);
-        if (ownerThread) targetThread = ownerThread;
-      }
+      const ownerThread = wnd?.ownerThreadId
+        ? this.threads.find(t => t.id === wnd.ownerThreadId)
+        : undefined;
+      targetThread = ownerThread ?? this.threads[0] ?? this.currentThread;
     }
 
     const queue = targetThread ? targetThread.messageQueue : this.messageQueue;
@@ -1268,10 +1279,53 @@ export class Emulator {
     }
     queue.push({ hwnd, message, wParam, lParam });
     if (onAvail) {
+      // Only resume immediately when the target thread is parked at its
+      // suspension point. If it is executing a nested callback (JS-initiated
+      // wndproc while GetMessage waits), completing the thunk now would
+      // corrupt the nested state — leave the message queued and the callback
+      // armed; flushPendingMessage() fires it when the nesting unwinds.
+      if ((targetThread?.wndProcDepth ?? this.wndProcDepth) > 0) return;
       if (targetThread) targetThread._onMessageAvailable = null;
       else this._onMessageAvailable = null;
+      // The resume callback completes the suspended GetMessage thunk against
+      // CPU registers — it must run in the waiting thread's context.
+      if (targetThread && this.currentThread !== targetThread) {
+        this.switchToThread(targetThread);
+      }
       onAvail();
     }
+  }
+
+  /** Fire a parked GetMessage resume if messages queued up while the thread
+   *  was executing a nested callback. Called when the nesting unwinds. */
+  flushPendingMessage(): void {
+    const t = this.currentThread;
+    const cb = t ? t._onMessageAvailable : null;
+    if (cb && this.waitingForMessage && this.messageQueue.length > 0 && this.wndProcDepth === 0) {
+      if (t) t._onMessageAvailable = null;
+      cb();
+    }
+  }
+
+  /** Wrap an async resume callback so it runs in the context of the thread
+   *  that was current when the wait began. Async waits (Sleep, GetMessage,
+   *  SwapBuffers, …) suspend a specific thread; by the time the JS callback
+   *  fires the scheduler may have switched to another thread, and completing
+   *  the thunk against the wrong thread's registers corrupts it. The captured
+   *  suspendSeq also guards against stale resumes: if the suspension this
+   *  callback belongs to has already completed, firing it again would pop the
+   *  stack a second time. */
+  captureThreadResume(fn: () => void): () => void {
+    const thread = this.currentThread;
+    const seq = thread ? thread.suspendSeq : -1;
+    return () => {
+      if (thread) {
+        if (!this.threads.includes(thread)) return; // thread exited while waiting
+        if (thread.suspendSeq !== seq) return;      // stale resume — suspension is gone
+        if (this.currentThread !== thread) this.switchToThread(thread);
+      }
+      fn();
+    };
   }
 
   // Timer management
@@ -1344,8 +1398,15 @@ export class Emulator {
           const next = this.getNextRunnableThread();
           if (next) {
             this.switchToThread(next);
+            return undefined;
+          }
+          // No immediately runnable thread. A thread blocked in GetMessage/
+          // Sleep is still alive — switch to it and idle until its async
+          // resume fires. The process only ends when every thread has exited.
+          const waiter = this.threads.find(t => !t.exited && t !== this.currentThread);
+          if (waiter) {
+            this.switchToThread(waiter);
           } else {
-            // All threads done
             this.exitedNormally = true;
             this.halted = true;
           }

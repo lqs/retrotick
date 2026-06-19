@@ -2,13 +2,14 @@ import type { Emulator } from '../../emulator';
 import type { BitmapInfo } from './types';
 import {
   SRCCOPY, NOTSRCCOPY, SRCPAINT, SRCAND, SRCINVERT, BLACKNESS, WHITENESS,
+  DSNA, PSDPXAX,
   SIZEOF_BITMAP,
 } from '../types';
 import type { DCInfo } from './types';
 import type { WindowInfo } from '../user32/types';
 import { colorToCSS, disableSmoothing } from './_helpers';
 import { decodeDib } from '../../../pe/decode-dib';
-import { dcPutImageData } from '../../emu-window';
+import { dcPutImageData, syncDibToCanvas } from '../../emu-window';
 import { resolvePaletteColors } from './palette';
 import { emuCompleteThunk } from '../../emu-exec';
 
@@ -59,8 +60,9 @@ export function registerBitmap(emu: Emulator): void {
     const bitsPtr = emu.readArg(3);
 
     // Read BITMAPINFOHEADER
+    const rawHeight = emu.memory.readI32(bmiPtr + 8);
     const width = Math.abs(emu.memory.readI32(bmiPtr + 4));
-    const height = Math.abs(emu.memory.readI32(bmiPtr + 8));
+    const height = Math.abs(rawHeight);
     const bpp = emu.memory.readU16(bmiPtr + 14);
     const w = Math.max(1, width);
     const h = Math.max(1, height);
@@ -71,10 +73,25 @@ export function registerBitmap(emu: Emulator): void {
     const pixelBuf = emu.allocHeap(bufSize);
     if (bitsPtr) emu.memory.writeU32(bitsPtr, pixelBuf);
 
+    // Capture the color table for paletted DIBs (follows the header)
+    let dibColorTable: number[] | undefined;
+    if (bpp <= 8) {
+      const biSize = emu.memory.readU32(bmiPtr);
+      const biClrUsed = emu.memory.readU32(bmiPtr + 32);
+      const numColors = biClrUsed || (1 << bpp);
+      dibColorTable = [];
+      for (let i = 0; i < numColors; i++) {
+        dibColorTable.push(emu.memory.readU32(bmiPtr + biSize + i * 4));
+      }
+    }
+
     const canvas = new OffscreenCanvas(w, h);
     const ctx = canvas.getContext('2d')!;
     disableSmoothing(ctx);
-    const bmp: BitmapInfo = { width: w, height: h, canvas, ctx, dibBitsPtr: pixelBuf, dibBpp: bpp };
+    const bmp: BitmapInfo = {
+      width: w, height: h, canvas, ctx,
+      dibBitsPtr: pixelBuf, dibBpp: bpp, dibTopDown: rawHeight < 0, dibColorTable,
+    };
     return emu.handles.alloc('bitmap', bmp);
   });
 
@@ -270,7 +287,123 @@ export function registerBitmap(emu: Emulator): void {
     return drawH;
   });
 
-  gdi32.register('StretchDIBits', 13, () => 0);
+  // Decode a region of a packed DIB (BITMAPINFO + bits in guest memory) into
+  // an ImageData. xSrc/ySrc/w/h are in image coordinates (y=0 at top).
+  function decodeDibRegion(
+    dc: DCInfo, bmiPtr: number, bitsPtr: number, fuUsage: number,
+    xSrc: number, ySrc: number, w: number, h: number,
+  ): ImageData | null {
+    const biSize = emu.memory.readU32(bmiPtr);
+    const biWidth = Math.abs(emu.memory.readI32(bmiPtr + 4));
+    const biHeight = emu.memory.readI32(bmiPtr + 8);
+    const biBitCount = emu.memory.readU16(bmiPtr + 14);
+    const biCompression = emu.memory.readU32(bmiPtr + 16);
+    const biClrUsed = emu.memory.readU32(bmiPtr + 32);
+    const isBottomUp = biHeight > 0;
+    const absHeight = Math.abs(biHeight);
+    if (biCompression !== 0) return null; // BI_RGB only
+
+    const numColors = biClrUsed || (biBitCount <= 8 ? (1 << biBitCount) : 0);
+    let palette: [number, number, number][];
+    if (fuUsage === 1 && numColors > 0) {
+      palette = resolvePaletteColors(emu, dc, bmiPtr, biSize, numColors);
+    } else {
+      palette = [];
+      const paletteOffset = bmiPtr + biSize;
+      for (let i = 0; i < numColors; i++) {
+        const b = emu.memory.readU8(paletteOffset + i * 4);
+        const g = emu.memory.readU8(paletteOffset + i * 4 + 1);
+        const r = emu.memory.readU8(paletteOffset + i * 4 + 2);
+        palette.push([r, g, b]);
+      }
+    }
+
+    let paddedRow: number;
+    if (biBitCount === 1) paddedRow = ((Math.ceil(biWidth / 8)) + 3) & ~3;
+    else if (biBitCount === 4) paddedRow = ((Math.ceil(biWidth / 2)) + 3) & ~3;
+    else if (biBitCount === 8) paddedRow = (biWidth + 3) & ~3;
+    else if (biBitCount === 24) paddedRow = (biWidth * 3 + 3) & ~3;
+    else if (biBitCount === 32) paddedRow = biWidth * 4;
+    else return null;
+
+    const drawW = Math.min(w, biWidth - xSrc);
+    const drawH = Math.min(h, absHeight - ySrc);
+    if (drawW <= 0 || drawH <= 0) return null;
+
+    const imgData = dc.ctx.createImageData(drawW, drawH);
+    const px = imgData.data;
+    for (let y = 0; y < drawH; y++) {
+      const imageRow = ySrc + y; // y=0 at top of image
+      const dataRow = isBottomUp ? (absHeight - 1 - imageRow) : imageRow;
+      const rowStart = bitsPtr + dataRow * paddedRow;
+      for (let x = 0; x < drawW; x++) {
+        const sx = xSrc + x;
+        const off = (y * drawW + x) * 4;
+        let r = 0, g = 0, b = 0;
+        if (biBitCount === 4) {
+          const byteVal = emu.memory.readU8(rowStart + (sx >> 1));
+          const idx = (sx & 1) === 0 ? (byteVal >> 4) & 0x0F : byteVal & 0x0F;
+          [r, g, b] = palette[idx] || [0, 0, 0];
+        } else if (biBitCount === 8) {
+          const idx = emu.memory.readU8(rowStart + sx);
+          [r, g, b] = palette[idx] || [0, 0, 0];
+        } else if (biBitCount === 1) {
+          const idx = (emu.memory.readU8(rowStart + (sx >> 3)) >> (7 - (sx & 7))) & 1;
+          [r, g, b] = palette[idx] || [0, 0, 0];
+        } else if (biBitCount === 24) {
+          const srcOff = rowStart + sx * 3;
+          b = emu.memory.readU8(srcOff);
+          g = emu.memory.readU8(srcOff + 1);
+          r = emu.memory.readU8(srcOff + 2);
+        } else if (biBitCount === 32) {
+          const srcOff = rowStart + sx * 4;
+          b = emu.memory.readU8(srcOff);
+          g = emu.memory.readU8(srcOff + 1);
+          r = emu.memory.readU8(srcOff + 2);
+        }
+        px[off] = r; px[off + 1] = g; px[off + 2] = b; px[off + 3] = 255;
+      }
+    }
+    return imgData;
+  }
+
+  // StretchDIBits(hdc, xDest, yDest, DestW, DestH, xSrc, ySrc, SrcW, SrcH, lpBits, lpbmi, iUsage, rop)
+  // Note: xSrc/ySrc are in DIB coordinates with the origin at the lower-left.
+  gdi32.register('StretchDIBits', 13, () => {
+    const hdc = emu.readArg(0);
+    const xDest = emu.readArg(1) | 0;
+    const yDest = emu.readArg(2) | 0;
+    const destW = emu.readArg(3) | 0;
+    const destH = emu.readArg(4) | 0;
+    const xSrc = emu.readArg(5) | 0;
+    const ySrcDib = emu.readArg(6) | 0;
+    const srcW = emu.readArg(7) | 0;
+    const srcH = emu.readArg(8) | 0;
+    const bitsPtr = emu.readArg(9);
+    const bmiPtr = emu.readArg(10);
+    const fuUsage = emu.readArg(11);
+
+    const dc = emu.getDC(hdc);
+    if (!dc || !bitsPtr || !bmiPtr || destW <= 0 || destH <= 0 || srcW <= 0 || srcH <= 0) return 0;
+
+    // Convert the lower-left-origin source Y to a top-origin Y
+    const absHeight = Math.abs(emu.memory.readI32(bmiPtr + 8));
+    const ySrcTop = absHeight - ySrcDib - srcH;
+    const img = decodeDibRegion(dc, bmiPtr, bitsPtr, fuUsage, xSrc, Math.max(0, ySrcTop), srcW, srcH);
+    if (!img) return 0;
+
+    if (img.width === destW && img.height === destH) {
+      dcPutImageData(dc, img, xDest, yDest);
+    } else {
+      const tmp = new OffscreenCanvas(img.width, img.height);
+      const tctx = tmp.getContext('2d')!;
+      tctx.putImageData(img, 0, 0);
+      disableSmoothing(dc.ctx);
+      dc.ctx.drawImage(tmp, 0, 0, img.width, img.height, xDest, yDest, destW, destH);
+    }
+    emu.syncDCToCanvas(hdc);
+    return img.height;
+  });
   gdi32.register('GetBitmapBits', 3, () => 0);
 
   gdi32.register('BitBlt', 9, () => {
@@ -302,6 +435,11 @@ export function registerBitmap(emu: Emulator): void {
 
     const srcDC = emu.getDC(hdcSrc);
     if (!srcDC) return 0;
+
+    // DIB sections share storage with the app — pull any direct pixel writes
+    // into the working canvases before reading them.
+    syncDibToCanvas(emu, srcDC);
+    syncDibToCanvas(emu, dstDC);
 
     const srcBmp = emu.handles.get<BitmapInfo>(srcDC.selectedBitmap);
     const dstBmp = emu.handles.get<BitmapInfo>(dstDC.selectedBitmap);
@@ -354,8 +492,6 @@ export function registerBitmap(emu: Emulator): void {
       return dstDC.ctx.getImageData(rawX, rawY, width, height);
     };
 
-    const PSDPxax = 0x00B8074A;
-
     if (rop === SRCCOPY) {
       if (srcMono || dstMono) {
         putResult(getConvertedSrcData());
@@ -399,7 +535,17 @@ export function registerBitmap(emu: Emulator): void {
         dstData.data[i + 2] ^= srcData.data[i + 2];
       }
       putResult(dstData);
-    } else if (rop === PSDPxax) {
+    } else if (rop === DSNA) {
+      // dst &= ~src (used as step 2 of the classic mask-blt transparency idiom)
+      const srcData = getConvertedSrcData();
+      const dstData = getDstData();
+      for (let i = 0; i < srcData.data.length; i += 4) {
+        dstData.data[i] &= ~srcData.data[i];
+        dstData.data[i + 1] &= ~srcData.data[i + 1];
+        dstData.data[i + 2] &= ~srcData.data[i + 2];
+      }
+      putResult(dstData);
+    } else if (rop === PSDPXAX) {
       // Ternary ROP: where src=0 → pattern (brush), where src=1 → dest
       // P ^ (D & (P ^ S)) — with mono→color conversion applied first
       const srcData = getConvertedSrcData();
@@ -416,6 +562,7 @@ export function registerBitmap(emu: Emulator): void {
       putResult(dstData);
     } else {
       // Default: SRCCOPY
+      console.warn(`[GDI] BitBlt: unimplemented ROP 0x${(rop >>> 0).toString(16)} — falling back to SRCCOPY`);
       dstDC.ctx.drawImage(srcDC.canvas, xSrc, ySrc, width, height, xDst, yDst, width, height);
     }
 
@@ -596,6 +743,7 @@ export function registerBitmap(emu: Emulator): void {
     const srcDC = emu.getDC(hdcSrc);
     if (!dstDC || !srcDC) return 0;
 
+    syncDibToCanvas(emu, srcDC);
     dstDC.ctx.drawImage(srcDC.canvas, xSrc, ySrc, wSrc, hSrc, xDst, yDst, wDst, hDst);
     emu.syncDCToCanvas(hdcDest);
     return 1;

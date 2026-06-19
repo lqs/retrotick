@@ -106,6 +106,8 @@ function scheduleImmediate(fn: () => void): void {
 }
 
 export function emuCompleteThunk(emu: Emulator, retVal: number, stackBytes: number): void {
+  // Invalidate stale async resume callbacks bound to this suspension
+  if (emu.currentThread) emu.currentThread.suspendSeq++;
   emu.cpu.reg[0] = retVal | 0; // EAX
   if (emu._v86Runtime) {
     // Under v86, the thunk's own `RET imm16` (when the parked CPU resumes)
@@ -232,11 +234,21 @@ function callStdcall(emu: Emulator, addr: number, args: number[]): number | unde
   }
   emu.wndProcDepth++;
 
-  // Save callee-saved registers
+  // Save callee-saved registers AND the suspended execution state. The CPU
+  // may be suspended mid-thunk (e.g. GetMessage waiting for a message) when a
+  // JS event invokes a callback directly — after the callback completes we
+  // must restore EIP/ESP/waitingForMessage so the pending async resume still
+  // finds the CPU exactly where it was suspended. waitingForMessage is
+  // cleared for the duration of the callback so the step loop below doesn't
+  // mistake the outer suspension for the callback going async.
   const savedEBX = emu.cpu.reg[3];
   const savedESI = emu.cpu.reg[6];
   const savedEDI = emu.cpu.reg[7];
   const savedEBP = emu.cpu.reg[5];
+  const savedEIP = emu.cpu.eip;
+  const savedESP = emu.cpu.reg[4];
+  const savedWaiting = emu.waitingForMessage;
+  emu.waitingForMessage = false;
 
   // Push args right-to-left (stdcall)
   for (let i = args.length - 1; i >= 0; i--) emu.cpu.push32(args[i]);
@@ -247,10 +259,18 @@ function callStdcall(emu: Emulator, addr: number, args: number[]): number | unde
   // Run a local step loop until the callback returns or goes async.
   // This reuses the frame stack so that WNDPROC_RETURN in emuTick
   // can also handle completion if we yield to async.
+  // The default completer restores the suspended state (a JS-direct call has
+  // no outer thunk to complete); when a thunk handler initiated this call the
+  // completer is replaced with emuCompleteThunk by the nesting logic.
   const frame = {
     savedEBX, savedEBP, savedESI, savedEDI,
     outerStackBytes: 0,
-    outerCompleter: emuCompleteThunk,
+    outerCompleter: (e: Emulator, _retVal: number, _sb: number) => {
+      e.cpu.eip = savedEIP;
+      e.cpu.reg[4] = savedESP;
+      e.waitingForMessage = savedWaiting;
+      e.flushPendingMessage();
+    },
   };
 
   const targetDepth = emu.wndProcDepth - 1;
@@ -376,11 +396,18 @@ function callStdcall(emu: Emulator, addr: number, args: number[]): number | unde
   // it from being picked up by a later RET instruction when the stack grows
   emu.memory.writeU32(wndProcRetThunkAddr, 0);
 
-  // Synchronous return — restore callee-saved registers
+  // Synchronous return — restore callee-saved registers and the suspended
+  // execution state. Restoring EIP/ESP/waitingForMessage keeps a suspended
+  // thunk (GetMessage, Sleep, …) intact when this callback was invoked from
+  // JS while the CPU was waiting.
   emu.cpu.reg[3] = savedEBX;
   emu.cpu.reg[5] = savedEBP;
   emu.cpu.reg[6] = savedESI;
   emu.cpu.reg[7] = savedEDI;
+  emu.cpu.eip = savedEIP;
+  emu.cpu.reg[4] = savedESP;
+  emu.waitingForMessage = savedWaiting;
+  emu.flushPendingMessage();
 
   return emu.wndProcResult;
 }
@@ -667,6 +694,8 @@ export function emuTick(emu: Emulator): void {
   // requestAnimationFrame(tick) are queued from different code paths.
   if (emu._tickRunning) return;
   emu._tickRunning = true;
+  // Fresh per-tick budget for synthesized WM_PAINT (animation busy-loops)
+  emu._paintSynthBudget = 8;
 
   try {
   // If waiting for DOS key (INT 21h AH=01/07/08) and key available, deliver it

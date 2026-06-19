@@ -57,6 +57,10 @@ export class Thread {
   messageQueue: WinMsg[] = [];
   waitingForMessage = false;
   _onMessageAvailable: (() => void) | null = null;
+  // Suspend generation — incremented every time a suspended thunk completes.
+  // Async resume callbacks capture this; a mismatch means the suspension they
+  // belong to is gone (already resumed or superseded) and they must not fire.
+  suspendSeq = 0;
 
   // Per-thread WndProc state
   wndProcDepth = 0;

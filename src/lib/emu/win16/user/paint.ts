@@ -168,5 +168,17 @@ export function registerWin16UserPaint(emu: Emulator, user: Win16Module, h: Win1
   // ───────────────────────────────────────────────────────────────────────────
   // Ordinal 127: ValidateRect(hWnd, lpRect) — 6 bytes (2+4)
   // ───────────────────────────────────────────────────────────────────────────
-  user.register('ValidateRect', 6, () => 1, 127);
+  // Clear the pending paint/erase flags (mirrors win32 ValidateRect). The stub
+  // `() => 1` left needsPaint set, so an app that validated its own region kept
+  // getting WM_PAINT re-synthesized. lpRect is ignored — we track a whole-window
+  // invalid flag, not a region, same as InvalidateRect here.
+  user.register('ValidateRect', 6, () => {
+    const [hWnd] = emu.readPascalArgs16([2, 4]);
+    const wnd = emu.handles.get<WindowInfo>(hWnd);
+    if (wnd) {
+      wnd.needsPaint = false;
+      wnd.needsErase = false;
+    }
+    return 1;
+  }, 127);
 }

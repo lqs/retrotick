@@ -8,7 +8,7 @@ import {
   WM_QUIT, WM_PAINT, WM_ERASEBKGND,
   WM_SETTEXT, WM_GETTEXT, WM_GETTEXTLENGTH,
   WM_CREATE, WM_NCCREATE, WM_NCCALCSIZE,
-  WM_TIMER, PM_REMOVE, CW_USEDEFAULT,
+  WM_TIMER, PM_REMOVE, CW_USEDEFAULT, HCBT_CREATEWND,
   TBM_GETPOS, TBM_GETRANGEMIN, TBM_GETRANGEMAX,
   TBM_SETPOS, TBM_SETRANGE, TBM_SETRANGEMIN, TBM_SETRANGEMAX,
 } from '../types';
@@ -17,8 +17,14 @@ export function registerMessage(emu: Emulator): void {
   const user32 = emu.registerDll('USER32.DLL');
 
   // Message loop
-  // Synthesize WM_PAINT for windows that need repainting
+  // Synthesize WM_PAINT for windows that need repainting.
+  // Throttled per tick: an app whose idle handler keeps invalidating
+  // (animation busy-loop) would otherwise spin inside a single tick forever
+  // — real Windows yields to the scheduler between frames; we yield via the
+  // PeekMessage suspend path once the per-tick budget is used up.
   const synthesizePaint = (): { hwnd: number; message: number; wParam: number; lParam: number } | null => {
+    if (emu._paintSynthBudget <= 0) return null;
+    emu._paintSynthBudget--;
     // Check all windows for needsPaint flag
     for (const [handle, wnd] of emu.handles.findByType('window') as [number, WindowInfo][]) {
       if (!wnd || !wnd.needsPaint) continue;
@@ -129,17 +135,18 @@ export function registerMessage(emu: Emulator): void {
     if (emu.wndProcDepth <= 1) {
       const stackBytes = emu._currentThunkStackBytes;
       emu.waitingForMessage = true;
-      const resumeWith0 = () => {
+      const waitThread = emu.currentThread;
+      const resumeWith0 = emu.captureThreadResume(() => {
         emu._onMessageAvailable = null;
         emu.waitingForMessage = false;
         emuCompleteThunk(emu, 0, stackBytes);
         if (emu.running && !emu.halted) {
           requestAnimationFrame(emu.tick);
         }
-      };
+      });
       emu._onMessageAvailable = resumeWith0;
       requestAnimationFrame(() => {
-        if (emu._onMessageAvailable === resumeWith0) resumeWith0();
+        if ((waitThread ? waitThread._onMessageAvailable : emu._onMessageAvailable) === resumeWith0) resumeWith0();
       });
       return undefined;
     }
@@ -156,17 +163,18 @@ export function registerMessage(emu: Emulator): void {
     // Queue is empty — wait for a message or next frame
     const stackBytes = emu._currentThunkStackBytes;
     emu.waitingForMessage = true;
-    const resumeWith1 = () => {
+    const waitThread = emu.currentThread;
+    const resumeWith1 = emu.captureThreadResume(() => {
       emu._onMessageAvailable = null;
       emu.waitingForMessage = false;
       emuCompleteThunk(emu, 1, stackBytes);
       if (emu.running && !emu.halted) {
         requestAnimationFrame(emu.tick);
       }
-    };
+    });
     emu._onMessageAvailable = resumeWith1;
     requestAnimationFrame(() => {
-      if (emu._onMessageAvailable === resumeWith1) resumeWith1();
+      if ((waitThread ? waitThread._onMessageAvailable : emu._onMessageAvailable) === resumeWith1) resumeWith1();
     });
     return undefined;
   });
@@ -198,14 +206,14 @@ export function registerMessage(emu: Emulator): void {
     // Wait for message or timeout
     const stackBytes = emu._currentThunkStackBytes;
     emu.waitingForMessage = true;
-    const timerId = setTimeout(() => {
+    const timerId = setTimeout(emu.captureThreadResume(() => {
       emu._onMessageAvailable = null;
       emu.waitingForMessage = false;
       emuCompleteThunk(emu, WAIT_TIMEOUT, stackBytes);
       if (emu.running && !emu.halted) {
         requestAnimationFrame(emu.tick);
       }
-    }, dwMilliseconds);
+    }), dwMilliseconds);
     emu._onMessageAvailable = () => {
       clearTimeout(timerId);
       emu.waitingForMessage = false;
@@ -232,12 +240,12 @@ export function registerMessage(emu: Emulator): void {
 
     const stackBytes = emu._currentThunkStackBytes;
     emu.waitingForMessage = true;
-    const timerId = setTimeout(() => {
+    const timerId = setTimeout(emu.captureThreadResume(() => {
       emu._onMessageAvailable = null;
       emu.waitingForMessage = false;
       emuCompleteThunk(emu, WAIT_TIMEOUT, stackBytes);
       if (emu.running && !emu.halted) requestAnimationFrame(emu.tick);
-    }, dwMilliseconds);
+    }), dwMilliseconds);
     emu._onMessageAvailable = () => {
       clearTimeout(timerId);
       emu.waitingForMessage = false;
@@ -423,13 +431,13 @@ export function registerMessage(emu: Emulator): void {
         emu.memory.writeU32(createStructAddr + 40, szClassPtr);
         emu.memory.writeU32(createStructAddr + 44, 0); // exStyle
 
-        // Fire CBT hooks
+        // Fire CBT hooks (CBTProc is a 3-arg stdcall)
         if (emu.cbtHooks.length > 0) {
           const cbtStruct = emu.allocHeap(8);
           emu.memory.writeU32(cbtStruct, createStructAddr);
           emu.memory.writeU32(cbtStruct + 4, 0);
           for (const hook of emu.cbtHooks) {
-            emu.callWndProc(hook.lpfn, 3, childHwnd, cbtStruct, 0);
+            emu.callCallback(hook.lpfn, [HCBT_CREATEWND, childHwnd, cbtStruct]);
           }
         }
 
@@ -600,7 +608,9 @@ export function registerMessage(emu: Emulator): void {
       }
     }
 
-    const cn = wnd.classInfo?.className?.toUpperCase() || '';
+    // Superclassed controls (e.g. Delphi's TComboBox over COMBOBOX) carry the
+    // base class in baseClassName — built-in message handling keys off it.
+    const cn = (wnd.classInfo?.baseClassName || wnd.classInfo?.className || '').toUpperCase();
 
     // Edit control messages (EM_*)
     if (cn === 'EDIT') {
@@ -1863,6 +1873,33 @@ export function registerMessage(emu: Emulator): void {
 
     return null; // not handled — proceed to wndProc
   };
+
+  // Expose for the BUILTIN_WNDPROC thunk (superclassed built-in controls
+  // call the original class wndProc via CallWindowProc)
+  emu._handleBuiltinMessage = handleBuiltinMessage;
+
+  // Callable wndProc thunks for built-in control classes. GetClassInfo
+  // returns these so a superclass's CallWindowProc reaches the built-in
+  // behavior (COMBOBOX/EDIT/LISTBOX message handling) instead of a stub.
+  const BUILTIN_WNDPROC_A = 0x00FE0008;
+  const BUILTIN_WNDPROC_W = 0x00FE000C;
+  for (const [addr, name, wide] of [[BUILTIN_WNDPROC_A, 'BUILTIN_WNDPROC_A', false], [BUILTIN_WNDPROC_W, 'BUILTIN_WNDPROC_W', true]] as const) {
+    emu.thunkToApi.set(addr, { dll: 'SYSTEM', name, stackBytes: 16 });
+    emu.thunkPages.add(addr >>> 12);
+    emu.apiDefs.set(`SYSTEM:${name}`, {
+      handler: () => {
+        const hwnd = emu.readArg(0);
+        const message = emu.readArg(1);
+        const wParam = emu.readArg(2);
+        const lParam = emu.readArg(3);
+        const r = handleBuiltinMessage(hwnd, message, wParam, lParam, wide);
+        return r ?? 0;
+      },
+      stackBytes: 16,
+    });
+  }
+  emu._builtinWndProcA = BUILTIN_WNDPROC_A;
+  emu._builtinWndProcW = BUILTIN_WNDPROC_W;
 
   user32.register('SendMessageA', 4, () => {
     const hwnd = emu.readArg(0);

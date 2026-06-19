@@ -248,8 +248,47 @@ export function registerString(emu: Emulator): void {
     return count;
   });
 
-  kernel32.register('CompareStringA', 6, () => 2); // CSTR_EQUAL
-  kernel32.register('CompareStringW', 6, () => 2);
+  // CompareString(Locale, dwCmpFlags, lpString1, cchCount1, lpString2, cchCount2)
+  // Returns CSTR_LESS_THAN=1, CSTR_EQUAL=2, CSTR_GREATER_THAN=3 (0 on error).
+  // Self-consistent ordinal comparison; cchCount=-1 means NUL-terminated.
+  const CSTR_LESS_THAN = 1;
+  const CSTR_EQUAL = 2;
+  const CSTR_GREATER_THAN = 3;
+  const NORM_IGNORECASE = 0x00000001;
+
+  const compareStringImpl = (wide: boolean): number => {
+    const flags = emu.readArg(1);
+    const p1 = emu.readArg(2);
+    const c1 = emu.readArg(3) | 0;
+    const p2 = emu.readArg(4);
+    const c2 = emu.readArg(5) | 0;
+    if (!p1 || !p2) return 0;
+
+    const readStr = (ptr: number, count: number): string => {
+      if (count === -1) {
+        return wide ? emu.memory.readUTF16String(ptr) : emu.memory.readCString(ptr);
+      }
+      let s = '';
+      for (let i = 0; i < count; i++) {
+        const ch = wide ? emu.memory.readU16(ptr + i * 2) : emu.memory.readU8(ptr + i);
+        s += String.fromCharCode(ch);
+      }
+      return s;
+    };
+
+    let s1 = readStr(p1, c1);
+    let s2 = readStr(p2, c2);
+    if (flags & NORM_IGNORECASE) {
+      s1 = s1.toLowerCase();
+      s2 = s2.toLowerCase();
+    }
+    if (s1 < s2) return CSTR_LESS_THAN;
+    if (s1 > s2) return CSTR_GREATER_THAN;
+    return CSTR_EQUAL;
+  };
+
+  kernel32.register('CompareStringA', 6, () => compareStringImpl(false));
+  kernel32.register('CompareStringW', 6, () => compareStringImpl(true));
 
   // OutputDebugStringA
   kernel32.register('OutputDebugStringA', 1, () => {

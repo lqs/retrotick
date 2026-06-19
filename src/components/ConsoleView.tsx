@@ -287,6 +287,35 @@ const EXTENDED_NAV_CODES = new Set([
   'NumpadDivide', 'NumpadEnter',
 ]);
 
+// Reverse map: printable character → US-layout scancode. Used by the Android
+// `beforeinput` path, where the IME emits characters but no usable `e.code`.
+const CHAR_TO_SCANCODE: Record<string, number> = {
+  ' ': 0x39,
+  '1': 0x02, '2': 0x03, '3': 0x04, '4': 0x05, '5': 0x06,
+  '6': 0x07, '7': 0x08, '8': 0x09, '9': 0x0A, '0': 0x0B,
+  '-': 0x0C, '=': 0x0D, '[': 0x1A, ']': 0x1B, '\\': 0x2B,
+  ';': 0x27, "'": 0x28, '`': 0x29, ',': 0x33, '.': 0x34, '/': 0x35,
+  q: 0x10, w: 0x11, e: 0x12, r: 0x13, t: 0x14, y: 0x15, u: 0x16,
+  i: 0x17, o: 0x18, p: 0x19,
+  a: 0x1E, s: 0x1F, d: 0x20, f: 0x21, g: 0x22, h: 0x23, j: 0x24,
+  k: 0x25, l: 0x26,
+  z: 0x2C, x: 0x2D, c: 0x2E, v: 0x2F, b: 0x30, n: 0x31, m: 0x32,
+};
+
+// Fallback for keydown events whose `e.code` is empty (Android Bluetooth
+// keyboards, some virtual keyboards). Only used when CODE_TO_SCANCODE misses.
+const KEY_TO_SCANCODE: Record<string, number> = {
+  ArrowUp: 0x48, ArrowDown: 0x50, ArrowLeft: 0x4B, ArrowRight: 0x4D,
+  Enter: 0x1C, Backspace: 0x0E, Tab: 0x0F, Escape: 0x01,
+  Home: 0x47, End: 0x4F, PageUp: 0x49, PageDown: 0x51,
+  Insert: 0x52, Delete: 0x53,
+};
+
+const KEY_IS_EXTENDED = new Set([
+  'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight',
+  'Home', 'End', 'PageUp', 'PageDown', 'Insert', 'Delete',
+]);
+
 function getModifierScan(code: string): number | undefined {
   if (code === 'ShiftLeft') return 0x2A;
   if (code === 'ShiftRight') return 0x36;
@@ -500,8 +529,13 @@ export function ConsoleView({ emu, focused = true, zoom = 1, smooth = false, onS
   }
 
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
+    // keyCode 229 = IME composition-in-progress notification (Android virtual
+    // keyboards, desktop IMEs). Cancelling these can disturb the IME pipeline
+    // — let them through; the actual character will arrive via `beforeinput`.
+    if (e.keyCode !== 229) {
+      e.preventDefault();
+      e.stopPropagation();
+    }
 
     // Don't accept input after program has exited
     if (emu.halted) return;
@@ -528,10 +562,13 @@ export function ConsoleView({ emu, focused = true, zoom = 1, smooth = false, onS
         if (e.getModifierState('ScrollLock')) newFlags |= 0x10; else newFlags &= ~0x10;
         if (newFlags !== bdaFlags) emu.memory.writeU8(0x0417, newFlags);
 
-        const scan = CODE_TO_SCANCODE[e.code];
+        // Primary lookup by physical code; fallback to `e.key` for sources
+        // that leave `e.code` empty (Android BT keyboard, some virtual KBs).
+        let scan = CODE_TO_SCANCODE[e.code];
+        if (scan === undefined) scan = KEY_TO_SCANCODE[e.key];
         if (scan === undefined) return;
         const browserChar = e.key.length === 1 ? e.key.charCodeAt(0) : undefined;
-        const isExtended = EXTENDED_NAV_CODES.has(e.code);
+        const isExtended = EXTENDED_NAV_CODES.has(e.code) || KEY_IS_EXTENDED.has(e.key);
         if (isExtended) emu.injectHwKey(0xE0);
         emu.injectHwKey(scan, browserChar);
         // Start typematic repeat for non-modifier keys
@@ -823,12 +860,47 @@ export function ConsoleView({ emu, focused = true, zoom = 1, smooth = false, onS
     // Ignore keyup for pure meta keys in DOS mode.
     if (MODIFIER_CODES.has(e.code)) return;
 
-    const scan = CODE_TO_SCANCODE[e.code];
+    let scan = CODE_TO_SCANCODE[e.code];
+    if (scan === undefined) scan = KEY_TO_SCANCODE[e.key];
     if (scan === undefined) return;
     emu.stopTypematic(scan);
-    if (EXTENDED_NAV_CODES.has(e.code)) emu.injectHwKey(0xE0);
+    if (EXTENDED_NAV_CODES.has(e.code) || KEY_IS_EXTENDED.has(e.key)) emu.injectHwKey(0xE0);
     emu.injectHwKey(scan | 0x80);
     emu.screenDirty = true;
+  }, [emu]);
+
+  // Android virtual keyboards (Gboard, etc.) emit keydown with keyCode=229
+  // and an empty `e.code`, so the keydown path can't see the typed character.
+  // The actual character arrives via `beforeinput`. We synthesise both
+  // make-code and break-code here because Android won't send a keyup either.
+  // On desktop, `e.preventDefault()` in `handleKeyDown` cancels the would-be
+  // text insertion, so this handler doesn't fire for normal physical keys.
+  const handleBeforeInput = useCallback((e: InputEvent) => {
+    if (emu.halted || !emu.isDOS) return;
+    if (emu.audioContext?.state === 'suspended') emu.audioContext.resume();
+
+    const inject = (scan: number, ascii?: number) => {
+      emu.injectHwKey(scan, ascii);
+      emu.injectHwKey(scan | 0x80);
+    };
+
+    if (e.inputType === 'insertText' && e.data) {
+      e.preventDefault();
+      for (const ch of e.data) {
+        const scan = CHAR_TO_SCANCODE[ch.toLowerCase()];
+        if (scan !== undefined) inject(scan, ch.charCodeAt(0));
+      }
+    } else if (e.inputType === 'deleteContentBackward') {
+      e.preventDefault();
+      inject(0x0E, 0x08);
+    } else if (e.inputType === 'insertLineBreak' || e.inputType === 'insertParagraph') {
+      e.preventDefault();
+      inject(0x1C, 0x0D);
+    } else {
+      return;
+    }
+    emu.screenDirty = true;
+    if (emu._dosWaitingForKey && emu.waitingForMessage) emu.deliverDosKey();
   }, [emu]);
 
   const handleClick = useCallback(() => {
@@ -968,6 +1040,11 @@ export function ConsoleView({ emu, focused = true, zoom = 1, smooth = false, onS
         }}
         onKeyDown={handleKeyDown}
         onKeyUp={handleKeyUp}
+        onBeforeInput={handleBeforeInput}
+        autoCapitalize="off"
+        autoComplete="off"
+        autoCorrect="off"
+        spellcheck={false}
         autoFocus
       />
     </div>

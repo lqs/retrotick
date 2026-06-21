@@ -14,15 +14,19 @@ export function registerEnv(emu: Emulator): void {
     return ptr;
   }
 
-  // Pre-allocate command line (A and W versions)
-  // Windows GetCommandLine returns full command line including program name
-  const cmdArgs = emu.commandLine || '';
-  const exeName = emu.exeName;
-  const cmdStr = cmdArgs ? `${exeName} ${cmdArgs}` : exeName;
-  const cmdLineAddrA = allocStaticData(cmdStr.length + 1);
-  emu.memory.writeCString(cmdLineAddrA, cmdStr);
-  const cmdLineAddrW = allocStaticData((cmdStr.length + 1) * 2);
-  emu.memory.writeUTF16String(cmdLineAddrW, cmdStr);
+  // Command line (A and W). Built LAZILY on first GetCommandLine call, not at
+  // registration: under the ring3 kernel the process's address space isn't active
+  // when DLLs are registered, so an eager write would land in the wrong AS (the
+  // guest would then read an empty string and, for a screensaver, miss its "/s"
+  // run flag and fall into config mode). By first call the guest is running with
+  // its own AS active and emu.exeName/commandLine are set.
+  // Windows GetCommandLine returns the full command line including the program name.
+  let cmdLineAddrA = 0, cmdLineAddrW = 0;
+  const cmdLineStr = (): string => {
+    const cmdArgs = emu.commandLine || '';
+    const exeName = emu.exeName || '';
+    return cmdArgs ? `${exeName} ${cmdArgs}` : exeName;
+  };
 
   // Build an ANSI environment block from emu.envVars: KEY=VALUE\0...\0\0
   const buildEnvBlockA = (): number => {
@@ -58,8 +62,14 @@ export function registerEnv(emu: Emulator): void {
   kernel32.register('FreeEnvironmentStringsA', 1, () => 1);
   kernel32.register('GetEnvironmentStrings', 0, () => buildEnvBlockA());
 
-  kernel32.register('GetCommandLineA', 0, () => cmdLineAddrA);
-  kernel32.register('GetCommandLineW', 0, () => cmdLineAddrW);
+  kernel32.register('GetCommandLineA', 0, () => {
+    if (!cmdLineAddrA) { const s = cmdLineStr(); cmdLineAddrA = allocStaticData(s.length + 1); emu.memory.writeCString(cmdLineAddrA, s); }
+    return cmdLineAddrA;
+  });
+  kernel32.register('GetCommandLineW', 0, () => {
+    if (!cmdLineAddrW) { const s = cmdLineStr(); cmdLineAddrW = allocStaticData((s.length + 1) * 2); emu.memory.writeUTF16String(cmdLineAddrW, s); }
+    return cmdLineAddrW;
+  });
 
   kernel32.register('GetStartupInfoA', 1, () => {
     const ptr = emu.readArg(0);

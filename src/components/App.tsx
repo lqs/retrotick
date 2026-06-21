@@ -480,11 +480,11 @@ export function App() {
   // Dev/E2E hook: launch an EXE by ArrayBuffer directly (Playwright verification).
   useEffect(() => {
     if (!import.meta.env.DEV) return;
-    (window as typeof window & { __runExe?: (ab: ArrayBuffer, name: string, extra?: Record<string, ArrayBuffer>) => void }).__runExe =
-      (ab, name, extra) => {
+    (window as typeof window & { __runExe?: (ab: ArrayBuffer, name: string, extra?: Record<string, ArrayBuffer>, commandLine?: string) => void }).__runExe =
+      (ab, name, extra, commandLine) => {
         const peInfo = parsePE(ab);
         const additional = extra ? new Map(Object.entries(extra)) : undefined;
-        handleRunExe(ab, peInfo, additional, name);
+        handleRunExe(ab, peInfo, additional, name, commandLine);
       };
   }, [handleRunExe]);
 

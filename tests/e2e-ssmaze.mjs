@@ -1,0 +1,18 @@
+import { chromium } from 'playwright'; import fs from 'node:fs';
+const scr = fs.readFileSync(new URL('../examples/ssmaze.scr', import.meta.url));
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 760, height: 600 } });
+const errs=[]; page.on('pageerror',e=>errs.push(String(e).slice(0,120)));
+await page.addInitScript(() => localStorage.setItem('retrotick-general', JSON.stringify({ v86Backend: true })));
+await page.goto('http://localhost:5173/', { waitUntil: 'networkidle' });
+await page.waitForFunction(() => typeof window.__runExe === 'function', { timeout: 15000 });
+await page.evaluate((b64) => { const bin=atob(b64); const u=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i); window.__runExe(u.buffer,'ssmaze.scr',undefined,'/s'); }, scr.toString('base64'));
+await page.waitForTimeout(7000);
+fs.mkdirSync('/tmp/e2e',{recursive:true});
+const st = await page.evaluate(()=>{ const e=window.__emu; const w=e?.handles.get(e.mainWindow); return { alive:!!e&&!e.halted&&(e.mainWindow>>>0)!==0, cls:w?.classInfo?.className||w?.classInfo?.baseClassName||'?', cmd: e?.commandLine, crash:!!document.body.textContent.match(/encountered a problem|Application Error/) }; }).catch(()=>({alive:false}));
+await page.screenshot({ path:'/tmp/e2e/ssmaze.png' });
+console.log(`[ssmaze] alive=${st.alive} class="${st.cls}" cmd="${st.cmd}" crash=${st.crash} pageerrors=${errs.length} ${errs[0]||''}`);
+await browser.close();
+const pass = st.alive && !st.crash;
+console.log(`\n[RESULT] ssmaze browser: ${pass?'PASS':'FAIL'}`);
+process.exit(pass?0:1);

@@ -625,7 +625,49 @@ export class KernelRuntime implements KernelMemHost {
         else { this.haltCpu(); void this.emu.stop(); } // park on HALT so the dispatch's iret doesn't run into garbage
     }
 
-    private goIdle(): void { this._idle = true; this.haltCpu(); }
+    private goIdle(): void { this._idle = true; this.haltCpu(); this.startFramePump(); }
+
+    // Continuous-repaint frame pump. The own-backend resets _paintSynthBudget and
+    // re-runs the message loop every rAF (emuTick), so an app that animates by
+    // painting in WM_PAINT and re-invalidating (e.g. an OpenGL screensaver, which
+    // uses no timer) keeps getting WM_PAINT. The kernel parks the CPU when its
+    // message loop blocks, so without this it would paint until the per-schedule
+    // budget runs out and then stall (black screen). Each frame: refill the budget
+    // for blocked procs and deliver WM_PAINT to any window still needing one.
+    private _framePumpId: number | null = null;
+    private startFramePump(): void {
+        if (this._framePumpId !== null || typeof requestAnimationFrame !== 'function') return;
+        const tick = (): void => {
+            this._framePumpId = null;
+            if (this._stopRequested) return;
+            let posted = false;
+            for (const p of this.procs) {
+                if (p.state !== 'blocked' || !p.emu) continue;
+                const emu = p.emu;
+                emu._paintSynthBudget = 8;
+                if (emu.messageQueue && emu.messageQueue.length > 0) continue; // don't pile up
+                try {
+                    for (const [h, w] of emu.handles.findByType('window')) {
+                        if (w && w.needsPaint && w.visible) {
+                            // Clear like synthesizePaint does: deliver one WM_PAINT per
+                            // invalidation. An animating app re-invalidates in its handler
+                            // (needsPaint→true again) and keeps getting frames; a static
+                            // app paints once and the pump goes quiet for it.
+                            w.needsPaint = false;
+                            emu.postMessage(h, 0x000F /* WM_PAINT */, 0, 0);
+                            posted = true;
+                            break;
+                        }
+                    }
+                } catch { /* */ }
+            }
+            // Keep pumping only while something is actually animating (a parked window
+            // still needed painting). Otherwise stop — goIdle restarts the pump the
+            // next time a process parks, so a re-invalidating app resumes frames.
+            if (posted && !this._stopRequested) this._framePumpId = requestAnimationFrame(tick) as unknown as number;
+        };
+        this._framePumpId = requestAnimationFrame(tick) as unknown as number;
+    }
 
     /** Make `proc` the running process: switch CR3/FS/TSS, then launch it
      *  (state 'new' → ring3 launcher) or restore its saved CPU state. */
@@ -894,5 +936,8 @@ export class KernelRuntime implements KernelMemHost {
     requestStop(): void { this._stopRequested = true; }
 
     async run(): Promise<void> { await this.emu.run(); }
-    async stop(): Promise<void> { await this.emu.stop(); }
+    async stop(): Promise<void> {
+        if (this._framePumpId !== null && typeof cancelAnimationFrame === 'function') { cancelAnimationFrame(this._framePumpId); this._framePumpId = null; }
+        await this.emu.stop();
+    }
 }

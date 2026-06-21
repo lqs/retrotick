@@ -572,7 +572,31 @@ export function registerBitmap(emu: Emulator): void {
 
   // OpenGL pixel format / swap support
   gdi32.register('ChoosePixelFormat', 2, () => 1); // return pixel format index 1
-  gdi32.register('DescribePixelFormat', 4, () => 1);
+  // Fill the PIXELFORMATDESCRIPTOR (40 bytes) with a standard 32-bit, double-
+  // buffered, OpenGL-capable RGBA format. Apps (e.g. OpenGL screensavers) call
+  // this to verify the format supports OpenGL via dwFlags; an unfilled struct
+  // lacks PFD_SUPPORT_OPENGL so they conclude "no OpenGL" and bail out.
+  gdi32.register('DescribePixelFormat', 4, () => {
+    const nBytes = emu.readArg(2);
+    const ppfd = emu.readArg(3);
+    if (ppfd && nBytes >= 40) {
+      for (let i = 0; i < 40; i += 4) emu.memory.writeU32(ppfd + i, 0);
+      const PFD_DOUBLEBUFFER = 0x1, PFD_DRAW_TO_WINDOW = 0x4, PFD_SUPPORT_OPENGL = 0x20;
+      emu.memory.writeU16(ppfd + 0, 40);                                          // nSize
+      emu.memory.writeU16(ppfd + 2, 1);                                           // nVersion
+      emu.memory.writeU32(ppfd + 4, PFD_DRAW_TO_WINDOW | PFD_SUPPORT_OPENGL | PFD_DOUBLEBUFFER);
+      emu.memory.writeU8(ppfd + 8, 0);                                            // iPixelType = PFD_TYPE_RGBA
+      emu.memory.writeU8(ppfd + 9, 32);                                           // cColorBits
+      emu.memory.writeU8(ppfd + 10, 8); emu.memory.writeU8(ppfd + 11, 16);        // red bits/shift
+      emu.memory.writeU8(ppfd + 12, 8); emu.memory.writeU8(ppfd + 13, 8);         // green bits/shift
+      emu.memory.writeU8(ppfd + 14, 8); emu.memory.writeU8(ppfd + 15, 0);         // blue bits/shift
+      emu.memory.writeU8(ppfd + 16, 8); emu.memory.writeU8(ppfd + 17, 24);        // alpha bits/shift
+      emu.memory.writeU8(ppfd + 23, 24);                                          // cDepthBits
+      emu.memory.writeU8(ppfd + 24, 8);                                           // cStencilBits
+      emu.memory.writeU8(ppfd + 26, 0);                                           // iLayerType = PFD_MAIN_PLANE
+    }
+    return 1; // one pixel format available
+  });
   gdi32.register('SetPixelFormat', 3, () => 1); // TRUE
   gdi32.register('SwapBuffers', 1, () => {
     const hdc = emu.readArg(0);

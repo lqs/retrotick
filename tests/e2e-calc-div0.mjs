@@ -1,0 +1,30 @@
+import { chromium } from 'playwright';
+import fs from 'node:fs';
+const APP_URL = process.env.APP_URL || 'http://localhost:5173/';
+const calc = fs.readFileSync(new URL('../examples/calc.exe', import.meta.url));
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 700, height: 500 } });
+const logs=[]; page.on('console',m=>logs.push(m.text())); page.on('pageerror',e=>logs.push('PAGEERR '+e.message));
+await page.addInitScript(() => localStorage.setItem('retrotick-general', JSON.stringify({ v86Backend: true })));
+await page.goto(APP_URL, { waitUntil: 'networkidle' });
+await page.waitForFunction(() => typeof window.__runExe === 'function', { timeout: 15000 });
+const b64 = calc.toString('base64');
+await page.evaluate((b64) => { const bin=atob(b64); const buf=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++)buf[i]=bin.charCodeAt(i); window.__runExe(buf.buffer,'calc.exe'); }, b64);
+await page.waitForTimeout(5000);
+const disp = () => page.evaluate(() => { const e=window.__emu; const m=e?.handles.get(e.mainWindow); const c=m?.children?.get?.(403); const w=c?e.handles.get(c):null; return (w?.title??'').trim(); });
+// SciCalc IDs: 1→125, ÷→90, 0→124, =→112
+const click = async (id) => { await page.evaluate((id)=>{const e=window.__emu;e.postMessage(e.mainWindow,0x0111,id,0);},id); await page.waitForTimeout(250); };
+await click(125); await click(90); await click(124); await click(112); // 1 / 0 =
+await page.waitForTimeout(800);
+const d = await disp();
+await page.screenshot({ path: '/tmp/e2e/calc-div0.png' });
+const av = logs.filter(l=>/kernel-AV/.test(l)).length;
+const exh = logs.filter(l=>/exhausted/.test(l)).length;
+const term = logs.filter(l=>/terminating/.test(l)).length;
+const alive = await page.evaluate(() => { const e=window.__emu; return !!e && !e.halted && (e.mainWindow>>>0)!==0; });
+console.log('[div0] display after 1/0= :', JSON.stringify(d), 'av=',av,'exhausted=',exh,'terminating=',term,'alive=',alive);
+console.log('[div0] last logs:', logs.slice(-6).join(' | '));
+await browser.close();
+const pass = av===0 && exh===0 && term===0 && alive;
+console.log(`\n[RESULT] calc divide-by-zero (v86 kernel): ${pass?'PASS':'FAIL'} (no crash, app alive, display=${JSON.stringify(d)})`);
+process.exit(pass?0:1);

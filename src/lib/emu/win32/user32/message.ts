@@ -11,7 +11,25 @@ import {
   WM_TIMER, PM_REMOVE, CW_USEDEFAULT, HCBT_CREATEWND,
   TBM_GETPOS, TBM_GETRANGEMIN, TBM_GETRANGEMAX,
   TBM_SETPOS, TBM_SETRANGE, TBM_SETRANGEMIN, TBM_SETRANGEMAX,
+  WM_SYSCOMMAND, WM_COMMAND, WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_RBUTTONDOWN,
+  WM_RBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONDBLCLK,
+  WM_NCLBUTTONDOWN, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDOWN, WM_NCMBUTTONDOWN,
 } from '../types';
+
+// Messages whose wndproc commonly BLOCKS — either running its own modal message
+// loop (button-down press/drag tracking) or popping a modal DialogBox/MessageBox
+// (WM_COMMAND from a menu, WM_SYSCOMMAND). Under the ring3 kernel these must run
+// the wndproc INLINE at ring3 (real DispatchMessage tail-calls the wndproc, so
+// wndProcDepth stays 0) so the modal loop / DialogBox can park and yield like the
+// main loop. A nested synchronous callback (wndProcDepth>0) can't suspend, so
+// DialogBox/MessageBox there return a default immediately and don't block —
+// causing a "Select Game" dialog and a "resign?" box to pop up at the same time.
+const MODAL_TRACKING_MESSAGES = new Set<number>([
+  WM_COMMAND, WM_SYSCOMMAND,
+  WM_LBUTTONDOWN, WM_LBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONDBLCLK,
+  WM_MBUTTONDOWN, WM_MBUTTONDBLCLK,
+  WM_NCLBUTTONDOWN, WM_NCLBUTTONDBLCLK, WM_NCRBUTTONDOWN, WM_NCMBUTTONDOWN,
+]);
 
 export function registerMessage(emu: Emulator): void {
   const user32 = emu.registerDll('USER32.DLL');
@@ -299,6 +317,16 @@ export function registerMessage(emu: Emulator): void {
     if (!wnd.wndProc) {
       const builtin = handleBuiltinMessage(hwnd, message, wParam, lParam);
       return builtin ?? 0;
+    }
+
+    // Ring3 kernel: for modal-tracking initiators, tail-call the wndproc INLINE
+    // (real DispatchMessage semantics) so a wndproc that runs its own message
+    // loop can park/yield. These messages have no DispatchMessage post-processing
+    // (only WM_TIMER/WM_PAINT below do), so returning here loses nothing.
+    const rt = emu._v86Runtime as { redirectToCallback?: (a: number, args: number[], e: unknown) => boolean } | null;
+    if (rt?.redirectToCallback && MODAL_TRACKING_MESSAGES.has(message)
+        && rt.redirectToCallback(wnd.wndProc, [hwnd, message, wParam, lParam], emu)) {
+      return undefined; // redirected — wndproc runs inline at ring3
     }
 
     // Call WndProc via stack frame replacement

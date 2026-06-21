@@ -230,6 +230,22 @@ function loadDll(emu: Emulator, rawName: string): number | undefined {
   const existing = emu.loadedModules.get(basename);
   if (existing) return existing.base;
 
+  // Ring3 kernel: load real DLLs (from additionalFiles) into the process address
+  // space and run DllMain via the kernel, not the own-backend loadDllFromBuffer
+  // (which steps cpu.step — absent here). System DLLs we only stub get a non-zero
+  // handle so GetProcAddress (which mints int 0x2E thunks) still works.
+  if (emu._kernelLoadLibrary) {
+    const base = emu._kernelLoadLibrary(rawName);
+    if (base) return base;
+    if (hasRegisteredApis(emu, basename)) return emu.pe.imageBase;
+    if (!emu.missingDlls.includes(basename)) {
+      emu.missingDlls.push(basename);
+      console.warn(`[LoadLibrary] Missing DLL: ${basename}`);
+      emu.onMissingDll?.(basename);
+    }
+    return 0;
+  }
+
   // Find in additionalFiles (case-insensitive, strip path prefixes from keys)
   let ab: ArrayBuffer | undefined;
   for (const [fname, data] of emu.additionalFiles) {
@@ -376,6 +392,20 @@ export function registerModule(emu: Emulator): void {
     if (exportAddr) {
       console.log(`[GetProcAddress] ${funcName} → 0x${exportAddr.toString(16)} (DLL code)`);
       return exportAddr;
+    }
+
+    // Ring3 kernel: mint a trappable `int 0x2E` thunk for any registered apiDef.
+    // (The own-backend thunkToApi/dynamicThunkPtr path below doesn't trap under
+    // v86, so it would hand back an address that faults when called.) Returns 0
+    // for unimplemented APIs so the caller's GetProcAddress-fallback path runs.
+    if (emu._kernelGetProcThunk) {
+      // Best-effort DLL name from the module handle (its base address); '' lets
+      // the hook match the function name across any registered DLL.
+      let dllName = '';
+      for (const [n, m] of emu.loadedModules) {
+        if (m.base === hModule || m.imageBase === hModule) { dllName = n; break; }
+      }
+      return emu._kernelGetProcThunk(dllName, funcName);
     }
 
     // Check if the function is already known in the thunk table

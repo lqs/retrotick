@@ -1,0 +1,18 @@
+import { chromium } from 'playwright'; import fs from 'node:fs';
+const b = fs.readFileSync(new URL('../examples/putty.exe', import.meta.url));
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 760, height: 600 } });
+const errs=[]; page.on('pageerror',e=>errs.push(String(e).slice(0,100)));
+await page.addInitScript(() => localStorage.setItem('retrotick-general', JSON.stringify({ v86Backend: true })));
+await page.goto('http://localhost:5173/', { waitUntil: 'networkidle' });
+await page.waitForFunction(() => typeof window.__runExe === 'function', { timeout: 15000 });
+const b64 = b.toString('base64');
+await page.evaluate((b64) => { const s=atob(b64); const u=new Uint8Array(s.length); for(let i=0;i<s.length;i++)u[i]=s.charCodeAt(i); window.__runExe(u.buffer,'putty.exe'); }, b64);
+await page.waitForTimeout(6000);
+fs.mkdirSync('/tmp/e2e',{recursive:true});
+const st = await page.evaluate(()=>{ const e=window.__emu; return { alive:!!e&&!e.halted&&(e.mainWindow>>>0)!==0, waiting:!!e?.waitingForMessage, crash:!!document.body.textContent.match(/encountered a problem|Application Error/) }; }).catch(()=>({alive:false}));
+await page.screenshot({ path:'/tmp/e2e/putty.png' });
+console.log(`[putty-e2e] alive=${st.alive} waiting=${st.waiting} crashDialog=${st.crash} pageerrors=${errs.length}`);
+await browser.close();
+console.log(`\n[RESULT] putty browser: ${st.alive&&!st.crash?'PASS':'FAIL'}`);
+process.exit(st.alive&&!st.crash?0:1);

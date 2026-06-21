@@ -22,6 +22,7 @@ import type { FileManager } from './file-manager';
 import { renderChildControls as _renderChildControls, notifyControlOverlays as _notifyControlOverlays } from './emu-render';
 import { getDC as _getDC, getWindowDC as _getWindowDC, promoteToMainWindow as _promoteToMainWindow, setupCanvasSize as _setupCanvasSize, beginPaint as _beginPaint, endPaint as _endPaint, syncDCToCanvas as _syncDCToCanvas, releaseChildDC as _releaseChildDC, dispatchToSehHandler as _dispatchToSehHandler, getBrush as _getBrush, getPen as _getPen, loadBitmapResource as _loadBitmapResource, loadBitmapResourceFromModule as _loadBitmapResourceFromModule, loadBitmapResourceByName as _loadBitmapResourceByName, loadCursorResourceByName as _loadCursorResourceByName, loadStringResource as _loadStringResource, loadIconResource as _loadIconResource } from './emu-window';
 import { emuLoad, emuFindResourceEntry } from './emu-load';
+import { raiseSehException as _raiseSehException } from './win32/kernel32/process';
 import { emuTick, emuCallWndProc, emuCallWndProc16, emuCallNative, emuCallCallback } from './emu-exec';
 import { emuTickARM, emuCallWndProcARM } from './emu-exec-arm';
 import { Thread } from './thread';
@@ -797,6 +798,17 @@ export class Emulator {
     currentReg: number;
     dispCtxAddr: number;
   } | null = null;
+  // Address an SEH handler returns to (traps back into handleSehDispatchReturn).
+  // Own-backend uses a magic thunk (0x00FE0004); the ring3 kernel overrides this
+  // with a per-process `int 0x2E` shim VA so the return is trappable under v86.
+  _sehReturnVA = 0;
+  // Ring3 kernel hook: mint a callable `int 0x2E` thunk VA for a runtime-resolved
+  // API (GetProcAddress). Returns 0 for unimplemented APIs. Null on own-backend.
+  _kernelGetProcThunk: ((dll: string, name: string) => number) | null = null;
+  // Ring3 kernel hook: load a real DLL (from additionalFiles) into the process
+  // address space at runtime and run its DllMain. Returns module base, 0 if not
+  // available. Null on own-backend (uses loadDllFromBuffer instead).
+  _kernelLoadLibrary: ((name: string) => number) | null = null;
 
   drawItemStructAddr = 0;
 
@@ -1491,6 +1503,12 @@ export class Emulator {
   syncDCToCanvas(hdc: number): void { _syncDCToCanvas(this, hdc); }
   releaseChildDC(hdc: number): void { _releaseChildDC(this, hdc); }
   dispatchToSehHandler(frameAddr: number): void { _dispatchToSehHandler(this, frameAddr); }
+  /** Build EXCEPTION_RECORD/CONTEXT and dispatch to the SEH chain. The live CPU
+   *  must already hold the faulting user context (the kernel #PF path sets it).
+   *  Returns undefined; on no handler it sets `halted`. */
+  raiseSehException(code: number, flags: number, params: number[], addr: number): undefined {
+    return _raiseSehException(this, code, flags, params, addr);
+  }
   getBrush(handle: number): BrushInfo | null { return _getBrush(this, handle); }
   getPen(handle: number): PenInfo | null { return _getPen(this, handle); }
   loadBitmapResource(resourceId: number): number { return _loadBitmapResource(this, resourceId); }

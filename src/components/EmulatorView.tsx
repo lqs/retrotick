@@ -593,7 +593,8 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
         !peInfo.isCOM && !peInfo.isMZ && !peInfo.isNE &&
         peInfo.coffHeader?.machine === 0x014C;
       if (gs.v86Backend && isPE32) {
-        const { attachV86PEToEmulator } = await import('../lib/emu/v86/bootstrap');
+        // Real ring3, per-process-page-table Windows kernel (this session's work).
+        const { attachKernelPEToEmulator } = await import('../lib/emu/v86/kernel-bootstrap');
         emu.canvas = canvas;
         emu.canvasCtx = canvas.getContext('2d');
         emu.isConsole = !!peInfo.optionalHeader && peInfo.optionalHeader.subsystem === 3;
@@ -605,7 +606,7 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
         if (additionalFiles) {
           for (const [name, data] of additionalFiles) emu.additionalFiles.set(name, data);
         }
-        await attachV86PEToEmulator(emu, arrayBuffer, peInfo, { wasmUrl: '/v86.wasm' });
+        await attachKernelPEToEmulator(emu, arrayBuffer, peInfo, { wasmUrl: '/v86.wasm' });
         return;
       }
 

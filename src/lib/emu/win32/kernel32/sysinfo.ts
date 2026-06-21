@@ -32,6 +32,12 @@ export function registerSysinfo(emu: Emulator): void {
     return (v.build << 16) | (v.minor << 8) | v.major;
   });
 
+  // VerifyVersionInfoW/A: report that the system meets the requested condition
+  // (we present as Windows 5.x; apps check ">= minimum"). Returning 0 (the
+  // no-handler default) makes version-gated apps like taskmgr take dead paths.
+  kernel32.register('VerifyVersionInfoW', 4, () => 1);
+  kernel32.register('VerifyVersionInfoA', 4, () => 1);
+
   kernel32.register('GetSystemInfo', 1, () => {
     const ptr = emu.readArg(0);
     // SYSTEM_INFO
@@ -140,13 +146,16 @@ export function registerSysinfo(emu: Emulator): void {
     const MBI_SIZE = 28;
     if (lpBuffer && dwLength >= MBI_SIZE) {
       const pageBase = lpAddress & ~0xFFF;
-      emu.memory.writeU32(lpBuffer + 0, pageBase);   // BaseAddress
-      emu.memory.writeU32(lpBuffer + 4, pageBase);   // AllocationBase
-      emu.memory.writeU32(lpBuffer + 8, 0x04);       // AllocationProtect = PAGE_READWRITE
-      emu.memory.writeU32(lpBuffer + 12, 0x1000);    // RegionSize = 4KB
-      emu.memory.writeU32(lpBuffer + 16, 0x1000);    // State = MEM_COMMIT
-      emu.memory.writeU32(lpBuffer + 20, 0x04);      // Protect = PAGE_READWRITE
-      emu.memory.writeU32(lpBuffer + 24, 0x20000);   // Type = MEM_PRIVATE
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const k = (emu._v86Runtime as any);
+      const q = (k && k.kQuery) ? k.kQuery(pageBase) : { state: 0x1000, protect: 0x04 };
+      emu.memory.writeU32(lpBuffer + 0, pageBase);          // BaseAddress
+      emu.memory.writeU32(lpBuffer + 4, pageBase);          // AllocationBase
+      emu.memory.writeU32(lpBuffer + 8, q.protect || 0x04); // AllocationProtect
+      emu.memory.writeU32(lpBuffer + 12, 0x1000);           // RegionSize = 4KB
+      emu.memory.writeU32(lpBuffer + 16, q.state);          // State
+      emu.memory.writeU32(lpBuffer + 20, q.protect || 0x04);// Protect
+      emu.memory.writeU32(lpBuffer + 24, 0x20000);          // Type = MEM_PRIVATE
     }
     return MBI_SIZE;
   });
@@ -158,13 +167,16 @@ export function registerSysinfo(emu: Emulator): void {
     const MBI_SIZE = 28; // MEMORY_BASIC_INFORMATION
     if (lpBuffer && dwLength >= MBI_SIZE) {
       const pageBase = lpAddress & ~0xFFF;
-      emu.memory.writeU32(lpBuffer + 0, pageBase);   // BaseAddress
-      emu.memory.writeU32(lpBuffer + 4, pageBase);   // AllocationBase
-      emu.memory.writeU32(lpBuffer + 8, 0x04);       // AllocationProtect = PAGE_READWRITE
-      emu.memory.writeU32(lpBuffer + 12, 0x1000);    // RegionSize = 4KB
-      emu.memory.writeU32(lpBuffer + 16, 0x1000);    // State = MEM_COMMIT
-      emu.memory.writeU32(lpBuffer + 20, 0x04);      // Protect = PAGE_READWRITE
-      emu.memory.writeU32(lpBuffer + 24, 0x20000);   // Type = MEM_PRIVATE
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const k = (emu._v86Runtime as any);
+      const q = (k && k.kQuery) ? k.kQuery(pageBase) : { state: 0x1000, protect: 0x04 };
+      emu.memory.writeU32(lpBuffer + 0, pageBase);          // BaseAddress
+      emu.memory.writeU32(lpBuffer + 4, pageBase);          // AllocationBase
+      emu.memory.writeU32(lpBuffer + 8, q.protect || 0x04); // AllocationProtect
+      emu.memory.writeU32(lpBuffer + 12, 0x1000);           // RegionSize = 4KB
+      emu.memory.writeU32(lpBuffer + 16, q.state);          // State
+      emu.memory.writeU32(lpBuffer + 20, q.protect || 0x04);// Protect
+      emu.memory.writeU32(lpBuffer + 24, 0x20000);          // Type = MEM_PRIVATE
     }
     return MBI_SIZE;
   });

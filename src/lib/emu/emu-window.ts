@@ -468,7 +468,9 @@ export function dispatchToSehHandler(emu: Emulator, frameAddr: number): void {
   emu.cpu.push32(state.ctxAddr);       // arg2: ContextRecord
   emu.cpu.push32(frameAddr);           // arg1: EstablisherFrame
   emu.cpu.push32(state.excRecAddr);    // arg0: ExceptionRecord
-  emu.cpu.push32(SEH_DISPATCH_RETURN_THUNK); // return address
+  // Return address: own-backend uses the magic thunk; the ring3 kernel overrides
+  // it with a trappable `int 0x2E` shim VA (handler RETs here → handleSehDispatchReturn).
+  emu.cpu.push32(emu._sehReturnVA || SEH_DISPATCH_RETURN_THUNK);
   emu.cpu.eip = handler;
 }
 

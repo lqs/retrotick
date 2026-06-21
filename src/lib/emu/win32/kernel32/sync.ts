@@ -94,7 +94,17 @@ export function registerSync(emu: Emulator): void {
       return undefined;
     }
     // Check handle state
-    const obj = emu.handles.get<EventInfo & { childEmu?: unknown; childExited?: boolean }>(hHandle);
+    const obj = emu.handles.get<EventInfo & { childEmu?: unknown; childExited?: boolean; kpid?: number }>(hHandle);
+    // Kernel-spawned child process handle — block until it exits (scheduler wakes us).
+    if (obj && obj.kpid !== undefined) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const krt = emu._v86Runtime as any;
+      const child = krt?.procByPid?.(obj.kpid);
+      if (!child || child.state === 'zombie') return WAIT_OBJECT_0;
+      emu.waitingForMessage = true;
+      krt.waitForProcess(child); // records this process as a waiter + requests park
+      return undefined;
+    }
     // Child process handle — block until child exits
     if (obj && obj.childEmu !== undefined) {
       if (obj.childExited) return WAIT_OBJECT_0;

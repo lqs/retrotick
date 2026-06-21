@@ -108,17 +108,19 @@ function scheduleImmediate(fn: () => void): void {
 export function emuCompleteThunk(emu: Emulator, retVal: number, stackBytes: number): void {
   // Invalidate stale async resume callbacks bound to this suspension
   if (emu.currentThread) emu.currentThread.suspendSeq++;
-  emu.cpu.reg[0] = retVal | 0; // EAX
   if (emu._v86Runtime) {
     // Under v86, the thunk's own `RET imm16` (when the parked CPU resumes)
-    // pops the caller's retAddr and the stdcall args. We only set EAX here
-    // and let resumeParked() unpark the CPU so the thunk's RET can execute.
+    // pops the caller's retAddr and the stdcall args. Pass the target emu +
+    // return value so the runtime can resume the RIGHT process (under the
+    // multi-process kernel, a different process may be running; writing the
+    // live EAX here would corrupt it).
     const rt = emu._v86Runtime as {
-      resumeParkedThunk: () => void;
+      resumeParkedThunk: (emu?: unknown, retVal?: number) => void;
     };
-    rt.resumeParkedThunk();
+    rt.resumeParkedThunk(emu, retVal);
     return;
   }
+  emu.cpu.reg[0] = retVal | 0; // EAX
   const retAddr = emu.memory.readU32(emu.cpu.reg[4] >>> 0);
   emu.cpu.reg[4] = (emu.cpu.reg[4] + 4 + stackBytes) | 0; // pop retAddr + args (stdcall)
   emu.cpu.eip = retAddr;
@@ -173,6 +175,16 @@ export function emuResume(emu: Emulator): void {
 /** Call a stdcall callback with N args. Used by callWndProc (4 args) and multimedia timers (5 args). */
 function callStdcall(emu: Emulator, addr: number, args: number[]): number | undefined {
   if (!addr) return 0;
+  // Magic built-in-control wndProc thunks (GetClassInfo returns these so a
+  // superclass's CallWindowProc reaches the built-in EDIT/BUTTON/etc behavior).
+  // They aren't real guest code — dispatch straight to the built-in handler with
+  // the (hwnd, msg, wParam, lParam) we already have. Under the ring3 kernel this
+  // is essential: running ring3 at 0x00FE0008 would jump into demand-zero memory.
+  if ((addr === emu._builtinWndProcA || addr === emu._builtinWndProcW) && emu._handleBuiltinMessage) {
+    const wide = addr === emu._builtinWndProcW;
+    const r = emu._handleBuiltinMessage(args[0], args[1], args[2], args[3], wide);
+    return r ?? 0;
+  }
   // v86 backend: run the callback synchronously by re-entering v86's wasm
   // main_loop from this trap handler. We push args + a fake return EIP that
   // points at a trampoline (OUT 0xE9 ; JMP $) inside v86 RAM; when the callee
@@ -181,9 +193,20 @@ function callStdcall(emu: Emulator, addr: number, args: number[]): number | unde
   // continued naturally, and propagate the callee's EAX up.
   if (emu._v86Runtime) {
     const rt = emu._v86Runtime as {
-      nestedRunUntilReturn: (n?: number) => void;
+      nestedRunUntilReturn?: (n?: number) => void;
+      callRing3Callback?: (addr: number, args: number[], emu: Emulator) => number;
       cbReturnVA: number;
     };
+    // Ring3 kernel backend owns the full ring3 user-stack setup. The legacy path
+    // below pushes onto cpu ESP, which is wrong when the process is parked in
+    // ring0 at GetMessage (e.g. a menu click dispatching WM_COMMAND) — the
+    // wndproc would then run on the ring0 stack and #PF (kernel-range).
+    if (rt.callRing3Callback) {
+      emu.wndProcDepth++;
+      const r = rt.callRing3Callback(addr, args, emu);
+      emu.wndProcDepth--;
+      return r;
+    }
     const cpu = emu.cpu;
     const savedEIP = cpu.eip;
     const savedESP = cpu.reg[4];

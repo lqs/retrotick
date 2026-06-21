@@ -305,6 +305,16 @@ export function registerProcess(emu: Emulator): void {
     const dwCreationFlags = emu.readArg(4);
     const lpThreadId = emu.readArg(5);
 
+    // Kernel backend: a real schedulable thread sharing the process address space.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const krt = emu._v86Runtime as any;
+    if (krt && krt.createThread && krt.current) {
+      const t = krt.createThread(krt.current, lpStartAddress, lpParameter, dwStackSize || 0x100000);
+      if (lpThreadId) emu.memory.writeU32(lpThreadId, t.tid);
+      console.log(`[THREAD] (kernel) CreateThread tid=${t.tid} start=0x${lpStartAddress.toString(16)} param=0x${lpParameter.toString(16)}`);
+      return emu.handles.alloc('thread', { ktid: t.tid });
+    }
+
     // Create the thread with its own stack and TEB
     const thread = emu.createThread(lpStartAddress, lpParameter, dwStackSize);
 
@@ -329,6 +339,9 @@ export function registerProcess(emu: Emulator): void {
   kernel32.register('GetCurrentThread', 0, () => 0xFFFFFFFE); // pseudo-handle
   kernel32.register('ExitThread', 1, () => {
     const exitCode = emu.readArg(0);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const krt = emu._v86Runtime as any;
+    if (krt && krt.requestThreadExit) { krt.requestThreadExit(); return undefined; }
     if (emu.currentThread) {
       emu.currentThread.exited = true;
       emu.currentThread.exitCode = exitCode;
@@ -453,6 +466,29 @@ export function registerProcess(emu: Emulator): void {
       return 0;
     }
 
+    // Pass only the arguments (strip program name) so the child doesn't see the exe name twice
+    const childArgs = stripProgramName(cmdLine);
+    const childExeData = emu.additionalFiles.get(matchedName);
+
+    // Kernel backend: spawn a real concurrent process with its own address space.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const krt = emu._v86Runtime as any;
+    if (krt && krt.spawn && childExeData) {
+      const childProc = krt.spawn(childExeData, matchedName, childArgs, emu.pid || 0);
+      if (childProc) {
+        if (lpProcessInformation) {
+          const hProcess = emu.handles.alloc('process', { kpid: childProc.pid, name: matchedName });
+          const hThread = emu.handles.alloc('thread', { kpid: childProc.pid, name: matchedName });
+          emu.memory.writeU32(lpProcessInformation, hProcess);
+          emu.memory.writeU32(lpProcessInformation + 4, hThread);
+          emu.memory.writeU32(lpProcessInformation + 8, childProc.pid);
+          emu.memory.writeU32(lpProcessInformation + 12, childProc.pid + 1);
+        }
+        console.log(`[CreateProcessA] spawned ${matchedName} as pid ${childProc.pid}`);
+        return 1;
+      }
+    }
+
     if (lpProcessInformation) {
       const hProcess = emu.handles.alloc('process', { name: matchedName });
       const hThread = emu.handles.alloc('thread', { name: matchedName });
@@ -462,9 +498,6 @@ export function registerProcess(emu: Emulator): void {
       emu.memory.writeU32(lpProcessInformation + 12, 101);
     }
 
-    // Pass only the arguments (strip program name) so the child doesn't see the exe name twice
-    const childArgs = stripProgramName(cmdLine);
-    const childExeData = emu.additionalFiles.get(matchedName);
     if (emu.isConsole && childExeData && isConsoleExe(childExeData) && emu.onCreateChildConsole) {
       const hProcess = lpProcessInformation ? emu.memory.readU32(lpProcessInformation) : 0;
       emu.onCreateChildConsole(matchedName, childArgs, hProcess);

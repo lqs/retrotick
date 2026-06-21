@@ -115,28 +115,42 @@ export function registerHeap(emu: Emulator): void {
     return emu.heapSize(hMem);
   });
 
+  // Kernel backend exposes real VAD/protection methods; legacy backend uses
+  // the bump allocator + no-op protect (no hardware enforcement there).
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const krt = () => (emu._v86Runtime as any);
+  const MEM_COMMIT = 0x1000, MEM_RESERVE = 0x2000;
+
   kernel32.register('VirtualAlloc', 4, () => {
     const addr = emu.readArg(0);
     const size = emu.readArg(1);
     const allocType = emu.readArg(2);
-    const _protect = emu.readArg(3);
-    // MEM_RESERVE=0x2000, MEM_COMMIT=0x1000
-    // Must return page-aligned addresses (Delphi memory manager depends on this)
+    const protect = emu.readArg(3) || 0x04; // default PAGE_READWRITE
+    // Must return page-aligned addresses (Delphi memory manager depends on this).
     const result = emu.allocVirtual(addr, size);
-    console.log(`[HEAP] VirtualAlloc(0x${addr.toString(16)}, 0x${size.toString(16)}, 0x${allocType.toString(16)}) => 0x${result.toString(16)}`);
+    const k = krt();
+    if (k && k.kCommit) {
+      if (allocType & MEM_RESERVE) k.kReserve(result, size);
+      if (allocType & MEM_COMMIT) k.kCommit(result, size, protect);
+    }
     return result;
   });
 
   kernel32.register('VirtualFree', 3, () => {
+    const addr = emu.readArg(0), size = emu.readArg(1), freeType = emu.readArg(2);
+    const k = krt();
+    if (k && k.kFree) k.kFree(addr, size, freeType);
     return 1;
   });
 
   kernel32.register('VirtualProtect', 4, () => {
-    const _addr = emu.readArg(0);
-    const _size = emu.readArg(1);
-    const _newProtect = emu.readArg(2);
+    const addr = emu.readArg(0);
+    const size = emu.readArg(1);
+    const newProtect = emu.readArg(2);
     const oldProtectPtr = emu.readArg(3);
-    if (oldProtectPtr) emu.memory.writeU32(oldProtectPtr, 0x40); // PAGE_EXECUTE_READWRITE
+    const k = krt();
+    const old = (k && k.kSetProtect) ? k.kSetProtect(addr, size, newProtect) : 0x40;
+    if (oldProtectPtr) emu.memory.writeU32(oldProtectPtr, old);
     return 1;
   });
 

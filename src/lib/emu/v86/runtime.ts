@@ -219,8 +219,9 @@ export class V86Runtime {
      *  and clear in_hlt so v86's main_loop picks up execution again. The
      *  thunk's RET imm16 then pops the caller's retAddr and stdcall args
      *  naturally. */
-    resumeParkedThunk(): void {
+    resumeParkedThunk(_emu?: unknown, retVal?: number): void {
         if (this._parkedEIP === null) return;
+        if (retVal !== undefined) this.cpu.reg32[0] = retVal | 0; // emuCompleteThunk no longer pre-sets EAX
         this.cpu.instruction_pointer[0] = this._parkedEIP;
         this._parkedEIP = null;
         this._inHlt[0] = 0;

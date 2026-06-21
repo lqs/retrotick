@@ -29,10 +29,31 @@ export function registerNtdll(emu: Emulator): void {
       // followed by NumberOfThreads * SYSTEM_THREAD_INFORMATION (0x40 each)
       const ENTRY_SIZE = 0xB8;
       const THREAD_SIZE = 0x40;
-      // Get process list from shared registry, or fall back to just this emulator
-      const procs = emu.processRegistry
-        ? emu.processRegistry.getProcessList()
-        : [{ pid: emu.pid || 1234, name: emu.exeName, threadCount: 1, basePriority: 8, handleCount: emu.handles.size(), workingSetSize: (emu.heapPtr - emu.heapBase + emu.virtualPtr - emu.virtualBase) || 0, cpuTime: emu.cpuTimeMs }];
+      // Process list: prefer the real ring3 kernel's process table (true
+      // concurrent processes with their own address spaces), else the shared
+      // registry, else just this emulator.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const krt = emu._v86Runtime as any;
+      let procs;
+      if (krt && Array.isArray(krt.procs)) {
+        // Collapse threads to processes (kernel models each thread as a KProc
+        // sharing a pid); count threads per pid; skip zombies.
+        const byPid = new Map<number, { pid: number; name: string; threadCount: number; basePriority: number; handleCount: number; workingSetSize: number; cpuTime: number }>();
+        for (const p of krt.procs) {
+          if (p.state === 'zombie') continue;
+          const ex = byPid.get(p.pid);
+          if (ex) { ex.threadCount++; continue; }
+          const name = (p.emu?.exeName) || 'process.exe';
+          byPid.set(p.pid, { pid: p.pid, name, threadCount: 1, basePriority: 8, handleCount: p.emu?.handles?.size?.() ?? 0, workingSetSize: 0x100000, cpuTime: 0 });
+        }
+        procs = [...byPid.values()];
+        // Synthesize a System Idle Process so the list looks like a real machine.
+        procs.unshift({ pid: 0, name: 'System Idle Process', threadCount: 1, basePriority: 0, handleCount: 0, workingSetSize: 0x1000, cpuTime: 0 });
+      } else {
+        procs = emu.processRegistry
+          ? emu.processRegistry.getProcessList()
+          : [{ pid: emu.pid || 1234, name: emu.exeName, threadCount: 1, basePriority: 8, handleCount: emu.handles.size(), workingSetSize: (emu.heapPtr - emu.heapBase + emu.virtualPtr - emu.virtualBase) || 0, cpuTime: emu.cpuTimeMs }];
+      }
       // Calculate total size: each process entry + 1 thread each + string data
       let strDataSize = 0;
       for (const p of procs) strDataSize += (p.name.length + 1) * 2;

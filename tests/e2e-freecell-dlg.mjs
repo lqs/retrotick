@@ -1,0 +1,27 @@
+import { chromium } from 'playwright'; import fs from 'node:fs';
+const fc = fs.readFileSync(new URL('../examples/freecell.exe', import.meta.url));
+const cards = fs.readFileSync(new URL('../examples/cards.dll', import.meta.url));
+const browser = await chromium.launch();
+const page = await browser.newPage({ viewport: { width: 820, height: 660 } });
+const logs=[]; page.on('console',m=>logs.push(m.text()));
+await page.addInitScript(() => localStorage.setItem('retrotick-general', JSON.stringify({ v86Backend: true })));
+await page.goto('http://localhost:5173/', { waitUntil: 'networkidle' });
+await page.waitForFunction(() => typeof window.__runExe === 'function', { timeout: 15000 });
+const b64=(b)=>b.toString('base64');
+await page.evaluate(([f,c]) => { const dec=(s)=>{const bin=atob(s);const u=new Uint8Array(bin.length);for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i);return u.buffer;}; window.__runExe(dec(f),'freecell.exe',{ 'cards.dll': dec(c) }); }, [b64(fc), b64(cards)]);
+await page.waitForTimeout(6000);
+fs.mkdirSync('/tmp/e2e',{recursive:true});
+const dlg=async()=>page.evaluate(()=>{const e=window.__emu;return{dlg:e?.dialogState?(e.dialogState.info?.title||'?'):null,boxes:(e?.messageBoxes?.length)||0,alive:!!e&&!e.halted&&(e.mainWindow>>>0)!==0};}).catch(()=>({alive:false}));
+await page.locator('text=Game').first().click().catch(()=>{});
+await page.waitForTimeout(300);
+await page.locator('text=/Select Game/i').first().click().catch(()=>{});
+await page.waitForTimeout(1000);
+const before=await dlg(); console.log('[fc] dialog shown:', JSON.stringify(before));
+// Simulate the dialog X / Cancel (what onClose→onDismiss(IDCANCEL)→dismissDialog does)
+await page.evaluate(()=>{ window.__emu?.dismissDialog?.(2, new Map()); });
+await page.waitForTimeout(1500);
+const after=await dlg(); console.log('[fc] after dialog cancel(X):', JSON.stringify(after));
+await page.screenshot({ path:'/tmp/e2e/fc-after-cancel.png' });
+const pass = before.dlg==='Game Number' && before.boxes===0 && after.alive && after.dlg===null;
+console.log(`\n[RESULT] freecell modal dialog: ${pass?'PASS':'FAIL'} (single blocked dialog; cancel closed dialog, freecell alive)`);
+await browser.close(); process.exit(pass?0:1);

@@ -59,6 +59,12 @@ export const WM_RBUTTONUP = 0x0205;
 export const WM_RBUTTONDBLCLK = 0x0206;
 export const WM_MBUTTONDOWN = 0x0207;
 export const WM_MBUTTONUP = 0x0208;
+export const WM_MBUTTONDBLCLK = 0x0209;
+// Non-client mouse button messages (title bar / borders)
+export const WM_NCLBUTTONDOWN = 0x00A1;
+export const WM_NCLBUTTONDBLCLK = 0x00A3;
+export const WM_NCRBUTTONDOWN = 0x00A4;
+export const WM_NCMBUTTONDOWN = 0x00A7;
 export const WM_USER = 0x0400;
 
 // Trackbar messages

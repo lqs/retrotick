@@ -13,6 +13,14 @@ export interface V86Cpu {
     gdtr_offset: Int32Array;
     gdtr_size: Int32Array;
     protected_mode: Uint8Array;
+    // x87 FPU state (exposed by v86 for CRT helpers like _ftol).
+    fpu_st: Int32Array;           // 8 slots × 4 i32 (F80: mantissa lo/hi, sign_exponent)
+    fpu_stack_ptr: Uint8Array;    // TOP pointer (0-7)
+    fpu_stack_empty: Uint8Array;  // per-slot empty bitmask
+    fpu_control_word: Uint16Array;
+    fpu_status_word: Uint16Array;
+    fpu_get_sti_f64(i: number): number; // value of ST(i) as f64
+    reg_xmm32s: Int32Array;             // SSE XMM registers, 8 regs × 4 i32
 }
 
 export interface V86IO {

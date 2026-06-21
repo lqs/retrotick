@@ -411,6 +411,25 @@ export class CPU implements ICpu {
     materializeFlags(this);
   }
 
+  // x87 stack access for CRT helpers (ICpu). Own-backend operates its JS stack
+  // directly; _ftol / _CIxxx use these so the FPU TOP pointer stays balanced.
+  fpuReadST0(): number { return this.fpuStack[this.fpuTop & 7]; }
+  fpuDoPop(): void {
+    this.fpuTW |= (3 << (this.fpuTop * 2));
+    this.fpuTop = (this.fpuTop + 1) & 7;
+  }
+  fpuPushVal(v: number): void {
+    this.fpuTop = (this.fpuTop - 1) & 7;
+    this.fpuStack[this.fpuTop] = v;
+    this.fpuI64[this.fpuTop] = undefined;
+    this.fpuRaw64[this.fpuTop] = undefined;
+    this.fpuRaw80[this.fpuTop] = undefined;
+    this.fpuTW &= ~(3 << (this.fpuTop * 2));
+  }
+  // SSE2 XMM low-double access (xmmF64 holds 2 doubles per 128-bit register).
+  readXmmF64(reg: number): number { return this.xmmF64[reg * 2]; }
+  writeXmmF64(reg: number, v: number): void { this.xmmF64[reg * 2] = v; }
+
   getFlags(): number {
     if (!this.flagsValid) materializeFlags(this);
     // Expose VM bit (17) when pseudo-V86 is active so guest PUSHF/PUSHFD

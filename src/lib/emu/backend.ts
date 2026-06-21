@@ -41,4 +41,19 @@ export interface ICpu {
     fpuStack?: Float64Array;
     fpuTop?: number;
     xmmF64?: Float64Array;
+
+    // Real x87 stack access for CRT helpers (_ftol, _CIxxx) that consume/produce
+    // operands on the FPU stack. Backend-specific: own-backend uses its JS stack,
+    // v86 reads/pops its hardware FPU. Prefer these over the raw fpuStack/fpuTop
+    // views, which are zero-filled stubs in v86 mode.
+    fpuReadST0?(): number;       // value of ST(0) as f64
+    fpuDoPop?(): void;           // pop ST(0): mark empty + advance TOP
+    fpuPushVal?(v: number): void; // push f64 onto the FPU stack (becomes ST(0))
+
+    // Real SSE2 XMM access for CRT helpers (_libm_sse2_*) that pass operands in
+    // XMM0/XMM1 and return in XMM0. Backend-specific: own-backend uses xmmF64,
+    // v86 reads/writes its hardware reg_xmm32s. Prefer these over the raw xmmF64
+    // view, which is a zero-filled stub in v86 mode.
+    readXmmF64?(reg: number): number;          // low 64 bits of XMMreg as f64
+    writeXmmF64?(reg: number, v: number): void;
 }

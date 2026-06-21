@@ -15,12 +15,18 @@ export function registerMsvcrt(emu: Emulator): void {
     buf.setUint32(4, hi, true);
     return buf.getFloat64(0, true);
   };
+  // Push a JS-computed result onto the guest's FPU stack as ST(0). v86 owns the
+  // hardware FPU (fpuPushVal); own-backend uses its module helper.
+  const pushResult = (v: number): void => {
+    if (emu.cpu.fpuPushVal) emu.cpu.fpuPushVal(v);
+    else fpuPush(emu.cpu, v);
+  };
   const unary = (fn: (x: number) => number) => () => {
-    fpuPush(emu.cpu, fn(readDoubleArg(0)));
+    pushResult(fn(readDoubleArg(0)));
     return 0;
   };
   const binary = (fn: (x: number, y: number) => number) => () => {
-    fpuPush(emu.cpu, fn(readDoubleArg(0), readDoubleArg(2)));
+    pushResult(fn(readDoubleArg(0), readDoubleArg(2)));
     return 0;
   };
   msvcrt.register('sin',   0, unary(Math.sin));
@@ -47,7 +53,7 @@ export function registerMsvcrt(emu: Emulator): void {
   msvcrt.register('ldexp', 0, () => {
     const x = readDoubleArg(0);
     const n = emu.readArg(2) | 0;
-    fpuPush(emu.cpu, x * Math.pow(2, n));
+    pushResult(x * Math.pow(2, n));
     return 0;
   });
 
@@ -607,25 +613,55 @@ export function registerMsvcrt(emu: Emulator): void {
     return result.length;
   });
 
-  // _ftol — float to long conversion (reads from FPU ST(0))
+  // _ftol — float to long conversion. The real CRT helper does `fistp`, which
+  // CONSUMES (pops) ST(0). We must pop too, or the FPU TOP pointer drifts and
+  // eventually overflows the 8-slot stack (→ x87 indefinite NaN). Read ST(0)
+  // through the backend's real FPU, not the zero-filled adapter view.
+  const readST0 = (): number => {
+    const c = emu.cpu;
+    if (c.fpuReadST0) return c.fpuReadST0();
+    return (c.fpuStack ? (c.fpuStack[(c.fpuTop ?? 0) & 7] || 0) : 0);
+  };
   msvcrt.register('_ftol', 0, () => {
-    const val = emu.cpu.fpuStack[emu.cpu.fpuTop & 7] || 0;
-    return Math.trunc(val) | 0;
+    const val = readST0();
+    emu.cpu.fpuDoPop?.();
+    return Number.isFinite(val) ? (Math.trunc(val) | 0) : 0;
+  });
+  msvcrt.register('_ftol2', 0, () => {
+    const val = readST0();
+    emu.cpu.fpuDoPop?.();
+    return Number.isFinite(val) ? (Math.trunc(val) | 0) : 0;
   });
 
-  // _libm_sse2_* — internal math helpers; take double in XMM0, return double in XMM0
-  msvcrt.register('_libm_sse2_cos_precise', 0, () => {
-    emu.cpu.xmmF64[0] = Math.cos(emu.cpu.xmmF64[0]);
-    return 0;
-  });
-  msvcrt.register('_libm_sse2_sin_precise', 0, () => {
-    emu.cpu.xmmF64[0] = Math.sin(emu.cpu.xmmF64[0]);
-    return 0;
-  });
-  msvcrt.register('_libm_sse2_sqrt_precise', 0, () => {
-    emu.cpu.xmmF64[0] = Math.sqrt(emu.cpu.xmmF64[0]);
-    return 0;
-  });
+  // _libm_sse2_* — MSVC internal math helpers using the SSE2 calling convention:
+  // the (double) argument arrives in XMM0 (second arg, for pow/atan2, in XMM1)
+  // and the result is returned in XMM0. Must read/write the REAL XMM register,
+  // not the zero-filled adapter view (which leaves v86's XMM0 = the input,
+  // making every call behave as identity).
+  const readXmm = (reg: number): number => {
+    const c = emu.cpu;
+    if (c.readXmmF64) return c.readXmmF64(reg);
+    return c.xmmF64 ? c.xmmF64[reg * 2] : 0;
+  };
+  const writeXmm = (reg: number, v: number): void => {
+    const c = emu.cpu;
+    if (c.writeXmmF64) { c.writeXmmF64(reg, v); return; }
+    if (c.xmmF64) c.xmmF64[reg * 2] = v;
+  };
+  const sse2Unary = (fn: (x: number) => number) => () => { writeXmm(0, fn(readXmm(0))); return 0; };
+  const sse2Binary = (fn: (x: number, y: number) => number) => () => { writeXmm(0, fn(readXmm(0), readXmm(1))); return 0; };
+  msvcrt.register('_libm_sse2_cos_precise', 0, sse2Unary(Math.cos));
+  msvcrt.register('_libm_sse2_sin_precise', 0, sse2Unary(Math.sin));
+  msvcrt.register('_libm_sse2_tan_precise', 0, sse2Unary(Math.tan));
+  msvcrt.register('_libm_sse2_acos_precise', 0, sse2Unary(Math.acos));
+  msvcrt.register('_libm_sse2_asin_precise', 0, sse2Unary(Math.asin));
+  msvcrt.register('_libm_sse2_atan_precise', 0, sse2Unary(Math.atan));
+  msvcrt.register('_libm_sse2_exp_precise', 0, sse2Unary(Math.exp));
+  msvcrt.register('_libm_sse2_log_precise', 0, sse2Unary(Math.log));
+  msvcrt.register('_libm_sse2_log10_precise', 0, sse2Unary(Math.log10));
+  msvcrt.register('_libm_sse2_sqrt_precise', 0, sse2Unary(Math.sqrt));
+  msvcrt.register('_libm_sse2_pow_precise', 0, sse2Binary(Math.pow));
+  msvcrt.register('_libm_sse2_atan2_precise', 0, sse2Binary(Math.atan2));
 
   // strcmp
   msvcrt.register('strcmp', 0, () => {
@@ -1786,7 +1822,7 @@ export function registerMsvcrt(emu: Emulator): void {
   msvcrt.register('atof', 0, () => {
     const str = emu.memory.readCString(emu.readArg(0));
     const v = parseFloat(str);
-    fpuPush(emu.cpu, isNaN(v) ? 0 : v);
+    pushResult(isNaN(v) ? 0 : v);
     return 0;
   });
 
@@ -1802,7 +1838,7 @@ export function registerMsvcrt(emu: Emulator): void {
     let v = 0;
     if (match) { consumed = match[0].length; v = parseFloat(match[0]); }
     if (endptrPtr) emu.memory.writeU32(endptrPtr, nptr + leadingSpaces + consumed);
-    fpuPush(emu.cpu, isNaN(v) ? 0 : v);
+    pushResult(isNaN(v) ? 0 : v);
     return 0;
   });
 

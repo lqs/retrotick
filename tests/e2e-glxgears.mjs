@@ -1,0 +1,17 @@
+import { chromium } from 'playwright'; import fs from 'node:fs';
+const exe = fs.readFileSync(new URL('../examples/glxgears.x86.exe', import.meta.url));
+const browser = await chromium.launch({ args: ['--use-gl=angle','--use-angle=swiftshader','--enable-unsafe-swiftshader','--ignore-gpu-blocklist'] });
+const page = await browser.newPage({ viewport: { width: 760, height: 600 } });
+const logs = [];
+page.on('console', m => { const t=m.text(); if(/GL1Context|glFrustum|glCallList|glNewList|Unimplemented|No API|WILD|terminated|exit|NaN|error/i.test(t)) logs.push(t.slice(0,160)); });
+page.on('pageerror', e => logs.push('[pageerror] '+e.message));
+await page.addInitScript(() => localStorage.setItem('retrotick-general', JSON.stringify({ v86Backend: true })));
+await page.goto('http://localhost:5173/', { waitUntil: 'networkidle' });
+await page.waitForFunction(() => typeof window.__runExe === 'function', { timeout: 15000 });
+await page.evaluate((b64) => { const bin=atob(b64); const u=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++)u[i]=bin.charCodeAt(i); window.__runExe(u.buffer,'glxgears.x86.exe'); }, exe.toString('base64'));
+await page.waitForTimeout(5000);
+console.log('=== notable logs ('+logs.length+') ===');
+for (const l of [...new Set(logs)].slice(0,40)) console.log(l);
+await page.screenshot({ path: '/private/tmp/claude-501/-Users-lqs-src-retrotick/4391c836-9852-424e-8e75-be31a7864597/scratchpad/glxgears.png' });
+await browser.close();
+process.exit(0);

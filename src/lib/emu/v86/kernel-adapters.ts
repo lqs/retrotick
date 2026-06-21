@@ -12,6 +12,10 @@ import { encodeMBCS, decodeMBCS } from '../memory';
 import type { V86Instance, V86Cpu as V86CpuRaw } from './types';
 import type { AddressSpace } from './addrspace';
 import { PAGE_SIZE, PAGE_MASK } from './kconst';
+import { f64ToF80 } from './fpu80';
+
+// Scratch view for XMM f64 <-> i32 pair conversion.
+const XMM_DV = new DataView(new ArrayBuffer(8));
 
 /** Host the adapters talk to: the live v86 instance/cpu and a thunk returning
  *  the currently scheduled process's address space. */
@@ -174,6 +178,41 @@ export class KernelCpu implements ICpu {
     get gs(): number { return this.host.cpu.sreg[5]; }
 
     getFlags(): number { return this.host.cpu.flags[0] >>> 0; }
+
+    // Real x87 stack access (v86 owns the hardware FPU). _ftol / _CIxxx use
+    // these so the FPU TOP pointer stays balanced across CRT thunk calls.
+    fpuReadST0(): number { return this.host.cpu.fpu_get_sti_f64(0); }
+    fpuDoPop(): void {
+        const cpu = this.host.cpu;
+        const top = cpu.fpu_stack_ptr[0] & 7;
+        cpu.fpu_stack_empty[0] |= (1 << top);
+        cpu.fpu_stack_ptr[0] = (top + 1) & 7;
+    }
+    fpuPushVal(v: number): void {
+        const cpu = this.host.cpu;
+        const top = (cpu.fpu_stack_ptr[0] - 1) & 7;
+        const { mantissa, signExp } = f64ToF80(v);
+        // fpu_st: 4 i32 per slot.
+        cpu.fpu_st[top * 4 + 0] = Number(mantissa & 0xFFFFFFFFn) | 0;
+        cpu.fpu_st[top * 4 + 1] = Number((mantissa >> 32n) & 0xFFFFFFFFn) | 0;
+        cpu.fpu_st[top * 4 + 2] = signExp | 0;
+        cpu.fpu_stack_empty[0] &= ~(1 << top);
+        cpu.fpu_stack_ptr[0] = top;
+    }
+
+    // XMM low-double access via v86's hardware reg_xmm32s (4 i32 per 128-bit reg).
+    readXmmF64(reg: number): number {
+        const x = this.host.cpu.reg_xmm32s;
+        XMM_DV.setInt32(0, x[reg * 4], true);
+        XMM_DV.setInt32(4, x[reg * 4 + 1], true);
+        return XMM_DV.getFloat64(0, true);
+    }
+    writeXmmF64(reg: number, v: number): void {
+        XMM_DV.setFloat64(0, v, true);
+        const x = this.host.cpu.reg_xmm32s;
+        x[reg * 4] = XMM_DV.getInt32(0, true);
+        x[reg * 4 + 1] = XMM_DV.getInt32(4, true);
+    }
 
     push32(val: number): void {
         const esp = (this.host.cpu.reg32[4] - 4) >>> 0;

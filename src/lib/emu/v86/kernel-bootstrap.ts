@@ -435,6 +435,37 @@ export function createProcessOnKernel(
         };
     }
 
+    // COM vtable thunks. Synthesized COM interfaces (DirectDraw/DirectSound/…)
+    // build per-method vtables of callable code pointers. The own-backend uses
+    // emu.dynamicThunkPtr + thunkToApi (intercepted in cpu.step); under the
+    // kernel there's no interpreter hook, so each method needs a real ring3
+    // `int 0x2E ; ret N` stub with a registered thunk site. Mint them from a
+    // dedicated pool, keyed by VA so setComThunkStackBytes can patch `ret N`.
+    {
+        const COM_POOL_PAGES = 96;             // 96 pages × 512 8-byte slots = 49152 thunks
+        const SLOT = 8;
+        const poolVA = emu.allocVirtual(0, COM_POOL_PAGES * PAGE_SIZE) >>> 0;
+        proc.as.mapRange(poolVA, COM_POOL_PAGES, PTE_PRESENT | PTE_RW | PTE_USER);
+        let next = poolVA;
+        const end = (poolVA + COM_POOL_PAGES * PAGE_SIZE) >>> 0;
+        emu._kernelMakeComThunk = (name: string, stackBytes: number, handler: () => number): number => {
+            if (next + SLOT > end) { console.warn('[kernel] COM thunk pool exhausted'); return 0; }
+            const id = rt.registerThunk({
+                dll: 'COM', name, stackBytes,
+                handler: () => { if (emu.traceApi) console.log(`[kernel-com] ${name}`); return handler(); },
+            });
+            const thunkVA = next; next += SLOT;
+            // int 0x2E ; ret N   (stdcall: callee pops `stackBytes` of args)
+            proc.as.writeBytes(thunkVA, new Uint8Array([0xCD, VEC_API, 0xC2, stackBytes & 0xFF, (stackBytes >>> 8) & 0xFF]));
+            rt.registerThunkSite(proc, thunkVA + 2, id);
+            return thunkVA;
+        };
+        emu._kernelSetThunkRet = (thunkVA: number, stackBytes: number): void => {
+            // Rewrite the imm16 of the `ret N` (stub byte 3..4).
+            proc.as.writeBytes((thunkVA + 3) >>> 0, new Uint8Array([stackBytes & 0xFF, (stackBytes >>> 8) & 0xFF]));
+        };
+    }
+
     const resourceDir = peInfo.optionalHeader.dataDirectories?.[2];
     emu.pe = {
         imageBase: loaded.imageBase, entryPoint: loaded.entryVA, stackTop: loaded.stackTop,

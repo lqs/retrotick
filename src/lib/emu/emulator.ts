@@ -809,6 +809,13 @@ export class Emulator {
   // address space at runtime and run its DllMain. Returns module base, 0 if not
   // available. Null on own-backend (uses loadDllFromBuffer instead).
   _kernelLoadLibrary: ((name: string) => number) | null = null;
+  // Ring3 kernel hook: mint a callable `int 0x2E` thunk VA bound to a JS handler,
+  // for synthesized COM vtables (DirectDraw/DirectSound/…). Returns the thunk VA.
+  // Null on own-backend, which uses the dynamicThunkPtr / thunkToApi path instead.
+  _kernelMakeComThunk: ((name: string, stackBytes: number, handler: () => number) => number) | null = null;
+  // Ring3 kernel hook: patch the `ret N` stack-cleanup imm of a COM thunk minted
+  // by _kernelMakeComThunk (callers set arg counts after vtable construction).
+  _kernelSetThunkRet: ((thunkVA: number, stackBytes: number) => void) | null = null;
 
   drawItemStructAddr = 0;
 

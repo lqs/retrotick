@@ -61,6 +61,19 @@ const DDPF_RGB = 0x00000040;
 // HRESULT codes
 const DD_OK = 0;
 const DDERR_GENERIC = 0x80004005;
+const E_NOINTERFACE = 0x80004002;
+// GUID.Data1 (first u32) of the IDirectDraw interface family + IUnknown. A
+// QueryInterface for any of these returns the same object; anything else (most
+// notably the IDirect3D* interfaces) must fail with E_NOINTERFACE so callers
+// fall back to the DirectDraw software path instead of using an unsupported
+// interface whose vtable we don't provide.
+const DDRAW_IID_DATA1 = new Set<number>([
+  0x00000000, // IID_IUnknown
+  0x6C14DB80, // IID_IDirectDraw
+  0xB3A6F3E0, // IID_IDirectDraw2
+  0x9C59509A, // IID_IDirectDraw4
+  0x15E65EC0, // IID_IDirectDraw7
+]);
 
 interface DDSurface {
   objAddr: number;        // COM object address
@@ -82,31 +95,27 @@ function allocComObject(emu: Emulator, prefix: string, methodCount: number, hand
   const objAddr = emu.allocHeap(4);
   emu.memory.writeU32(objAddr, vtableAddr);
 
-  // For each method, create a thunk
+  // For each method, create a thunk. Under the ring3 kernel, vtable entries must
+  // be real callable `int 0x2E` stubs (the own-backend's dynamicThunkPtr path is
+  // only intercepted by cpu.step, which the kernel doesn't use). Default the
+  // stdcall cleanup to 4 (`this` only); callers patch it via setComThunkStackBytes.
+  const kernel = !!emu._kernelMakeComThunk;
   for (let i = 0; i < methodCount; i++) {
-    const thunkAddr = emu.dynamicThunkPtr;
-    emu.dynamicThunkPtr += 4;
-    emu.memory.writeU32(vtableAddr + i * 4, thunkAddr);
-
     const methodName = `${prefix}_Method${i}`;
-    // COM methods use stdcall, 'this' pointer is first arg
-    // The handler should read args starting from readArg(0) = this, readArg(1) = first real arg, etc.
-    const handler = handlers[i];
-    if (handler) {
-      emu.thunkToApi.set(thunkAddr, { dll: 'DDRAW.DLL', name: methodName, stackBytes: 0 });
-      emu.thunkPages.add(thunkAddr >>> 12);
-      emu.apiDefs.set(`DDRAW.DLL:${methodName}`, { handler, stackBytes: 0 });
+    const handler = handlers[i] ?? (() => {
+      console.log(`Unimplemented COM: ${methodName} (vtable offset 0x${(i * 4).toString(16)})`);
+      return DD_OK;
+    });
+    if (kernel) {
+      const thunkVA = emu._kernelMakeComThunk!(`DDRAW:${methodName}`, 4, handler);
+      emu.memory.writeU32(vtableAddr + i * 4, thunkVA);
     } else {
-      // Default: return DD_OK, pop 'this' only (nArgs=1 for unknown)
-      // We don't know the arg count, so use nArgs=0 and let it be cdecl-ish
-      // Actually COM is stdcall with 'this' as hidden first arg on stack
-      // But our thunk system handles this: nArgs includes 'this'
-      emu.thunkToApi.set(thunkAddr, { dll: 'DDRAW.DLL', name: methodName, stackBytes: 4 });
+      const thunkAddr = emu.dynamicThunkPtr;
+      emu.dynamicThunkPtr += 4;
+      emu.memory.writeU32(vtableAddr + i * 4, thunkAddr);
+      emu.thunkToApi.set(thunkAddr, { dll: 'DDRAW.DLL', name: methodName, stackBytes: handlers[i] ? 0 : 4 });
       emu.thunkPages.add(thunkAddr >>> 12);
-      emu.apiDefs.set(`DDRAW.DLL:${methodName}`, { handler: () => {
-        console.log(`Unimplemented COM: ${methodName} (vtable offset 0x${(i * 4).toString(16)})`);
-        return DD_OK;
-      }, stackBytes: 4 });
+      emu.apiDefs.set(`DDRAW.DLL:${methodName}`, { handler, stackBytes: handlers[i] ? 0 : 4 });
     }
   }
 
@@ -123,6 +132,7 @@ export function registerDdraw(emu: Emulator): void {
   function setComThunkStackBytes(objAddr: number, methodIndex: number, nArgs: number) {
     const vtableAddr = emu.memory.readU32(objAddr);
     const thunkAddr = emu.memory.readU32(vtableAddr + methodIndex * 4);
+    if (emu._kernelSetThunkRet) { emu._kernelSetThunkRet(thunkAddr, nArgs * 4); return; }
     const info = emu.thunkToApi.get(thunkAddr);
     if (info) info.stackBytes = nArgs * 4;
   }
@@ -487,8 +497,17 @@ export function registerDdraw(emu: Emulator): void {
     // QueryInterface (0) - this, riid, ppv
     handlers[0] = () => {
       const thisPtr = emu.readArg(0);
+      const riid = emu.readArg(1);
       const ppv = emu.readArg(2);
-      // Return the same object for any interface query (IDirectDraw, IDirectDraw2, IDirectDraw4, IDirectDraw7)
+      const data1 = riid ? emu.memory.readU32(riid) >>> 0 : 0;
+      // Only the IDirectDraw family is supported. Refuse IDirect3D* (and anything
+      // else) so the caller takes its non-D3D / software path rather than calling
+      // through an interface we can't back.
+      if (!DDRAW_IID_DATA1.has(data1)) {
+        console.log(`[DDRAW] QueryInterface unsupported iid.Data1=0x${data1.toString(16)} → E_NOINTERFACE`);
+        if (ppv) emu.memory.writeU32(ppv, 0);
+        return E_NOINTERFACE;
+      }
       if (ppv) emu.memory.writeU32(ppv, thisPtr);
       return DD_OK;
     };

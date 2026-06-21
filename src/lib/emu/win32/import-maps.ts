@@ -48,6 +48,29 @@ export const ORDINAL_MAP: Record<string, Record<number, string>> = {
         113: 'WSAAsyncGetHostByName', 114: 'WSAAsyncGetHostByAddr',
         115: 'WSACancelAsyncRequest', 116: 'WSAAsyncSelect',
     },
+    // WSOCK32 ordinals DIFFER from WS2_32 above ordinal 100 (WSOCK32 115/116 are
+    // WSAStartup/WSACleanup, not WSACancelAsyncRequest/WSAAsyncSelect). Must be
+    // resolved against this table BEFORE the WSOCK32→WS2_32 alias is applied.
+    'WSOCK32.DLL': {
+        1: 'accept', 2: 'bind', 3: 'closesocket', 4: 'connect',
+        5: 'getpeername', 6: 'getsockname', 7: 'getsockopt',
+        8: 'htonl', 9: 'htons', 10: 'ioctlsocket',
+        11: 'inet_addr', 12: 'inet_ntoa', 13: 'listen',
+        14: 'ntohl', 15: 'ntohs', 16: 'recv', 17: 'recvfrom',
+        18: 'select', 19: 'send', 20: 'sendto', 21: 'setsockopt',
+        22: 'shutdown', 23: 'socket',
+        51: 'gethostbyaddr', 52: 'gethostbyname',
+        53: 'getprotobyname', 54: 'getprotobynumber',
+        55: 'getservbyname', 56: 'getservbyport', 57: 'gethostname',
+        101: 'WSAAsyncSelect', 102: 'WSAAsyncGetHostByAddr',
+        103: 'WSAAsyncGetHostByName', 104: 'WSAAsyncGetProtoByName',
+        105: 'WSAAsyncGetProtoByNumber', 106: 'WSAAsyncGetServByName',
+        107: 'WSAAsyncGetServByPort', 108: 'WSACancelAsyncRequest',
+        109: 'WSASetBlockingHook', 110: 'WSAUnhookBlockingHook',
+        111: 'WSAGetLastError', 112: 'WSASetLastError',
+        113: 'WSACancelBlockingCall', 114: 'WSAIsBlocking',
+        115: 'WSAStartup', 116: 'WSACleanup',
+    },
     'OLEAUT32.DLL': {
         2: 'SysAllocString', 3: 'SysReAllocString', 4: 'SysAllocStringLen',
         5: 'SysReAllocStringLen', 6: 'SysFreeString', 7: 'SysStringLen',
@@ -75,6 +98,7 @@ export const DLL_ALIASES: Record<string, string> = {
     'API-MS-WIN-CRT-PROCESS-L1-1-0.DLL': 'MSVCRT.DLL',
     'UCRTBASE.DLL': 'MSVCRT.DLL',
     'VCRUNTIME140.DLL': 'MSVCRT.DLL',
+    'WSOCK32.DLL': 'WS2_32.DLL',
 };
 
 export const CDECL_DLLS = new Set([

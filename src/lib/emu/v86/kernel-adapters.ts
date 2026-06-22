@@ -71,16 +71,39 @@ export class KernelMemory implements IMemory {
         return base + (va & PAGE_MASK);
     }
 
+    // A multi-byte access straddles a page boundary when its last byte lands in
+    // the next 4 KiB page. Consecutive virtual pages are NOT physically
+    // contiguous, so a DataView read/write at phys(a) would run off into the
+    // wrong physical page. In that (rare) case, go byte-by-byte through phys().
+    private straddles(a: number, len: number): boolean { return (a & PAGE_MASK) > PAGE_SIZE - len; }
+
     readU8(a: number): number { this.ensureFresh(); return this.mem8[this.phys(a >>> 0)]; }
-    readU16(a: number): number { this.ensureFresh(); return this.memDv.getUint16(this.phys(a >>> 0), true); }
-    readU32(a: number): number { this.ensureFresh(); return this.memDv.getUint32(this.phys(a >>> 0), true); }
+    readU16(a: number): number {
+        this.ensureFresh(); a = a >>> 0;
+        if (!this.straddles(a, 2)) return this.memDv.getUint16(this.phys(a), true);
+        return this.mem8[this.phys(a)] | (this.mem8[this.phys(a + 1)] << 8);
+    }
+    readU32(a: number): number {
+        this.ensureFresh(); a = a >>> 0;
+        if (!this.straddles(a, 4)) return this.memDv.getUint32(this.phys(a), true);
+        return (this.mem8[this.phys(a)] | (this.mem8[this.phys(a + 1)] << 8) | (this.mem8[this.phys(a + 2)] << 16) | (this.mem8[this.phys(a + 3)] << 24)) >>> 0;
+    }
     readI8(a: number): number { this.ensureFresh(); return this.memDv.getInt8(this.phys(a >>> 0)); }
-    readI16(a: number): number { this.ensureFresh(); return this.memDv.getInt16(this.phys(a >>> 0), true); }
-    readI32(a: number): number { this.ensureFresh(); return this.memDv.getInt32(this.phys(a >>> 0), true); }
+    readI16(a: number): number { return (this.readU16(a) << 16) >> 16; }
+    readI32(a: number): number { return this.readU32(a) | 0; }
 
     writeU8(a: number, v: number): void { this.ensureFresh(); this.mem8[this.phys(a >>> 0)] = v; }
-    writeU16(a: number, v: number): void { this.ensureFresh(); this.memDv.setUint16(this.phys(a >>> 0), v, true); }
-    writeU32(a: number, v: number): void { this.ensureFresh(); this.memDv.setUint32(this.phys(a >>> 0), v, true); }
+    writeU16(a: number, v: number): void {
+        this.ensureFresh(); a = a >>> 0;
+        if (!this.straddles(a, 2)) { this.memDv.setUint16(this.phys(a), v, true); return; }
+        this.mem8[this.phys(a)] = v & 0xFF; this.mem8[this.phys(a + 1)] = (v >>> 8) & 0xFF;
+    }
+    writeU32(a: number, v: number): void {
+        this.ensureFresh(); a = a >>> 0;
+        if (!this.straddles(a, 4)) { this.memDv.setUint32(this.phys(a), v, true); return; }
+        this.mem8[this.phys(a)] = v & 0xFF; this.mem8[this.phys(a + 1)] = (v >>> 8) & 0xFF;
+        this.mem8[this.phys(a + 2)] = (v >>> 16) & 0xFF; this.mem8[this.phys(a + 3)] = (v >>> 24) & 0xFF;
+    }
     writeI16(a: number, v: number): void { this.writeU16(a, v); }
     writeI32(a: number, v: number): void { this.writeU32(a, v); }
 

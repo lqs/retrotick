@@ -713,6 +713,13 @@ export class KernelRuntime implements KernelMemHost {
         // If we're synchronously inside a callback's _mainLoop, don't re-enter the
         // CPU now — the readied proc is drained after the callback returns.
         if (this._cbBusy) return;
+        // If we're synchronously inside ANOTHER thread's API handler (e.g. a
+        // worker thread's PostMessage waking the GUI thread parked in GetMessage),
+        // we can't switch the live CPU now — that would abandon the running
+        // thread mid-handler. Leave the target ready; the cooperative scheduler
+        // runs it when the current thread next blocks. (Single-threaded processes
+        // never hit this: proc === this.current there.)
+        if (this._handlerActive && proc !== this.current) return;
         // Otherwise we're in the browser event loop with no proc actively running
         // (the wasm loop only executes synchronously inside our runProc/_mainLoop).
         // Run the readied proc — gating only on _idle would wedge it whenever the

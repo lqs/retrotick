@@ -546,8 +546,9 @@ export function registerBitmap(emu: Emulator): void {
       }
       putResult(dstData);
     } else if (rop === PSDPXAX) {
-      // Ternary ROP: where src=0 → pattern (brush), where src=1 → dest
-      // P ^ (D & (P ^ S)) — with mono→color conversion applied first
+      // Ternary ROP 0x00B8074A "PSDPxax": result = P ^ (S & (D ^ P)).
+      // Per bit: src=0 → pattern (brush), src=1 → dest. (mono→color applied to
+      // the source first, so a black/white mask yields S=0x00/0xFF channels.)
       const srcData = getConvertedSrcData();
       const dstData = getDstData();
       const brush = emu.getBrush(dstDC.selectedBrush);
@@ -555,9 +556,9 @@ export function registerBitmap(emu: Emulator): void {
       const pR = patColor & 0xFF, pG = (patColor >> 8) & 0xFF, pB = (patColor >> 16) & 0xFF;
       const sp = srcData.data, dp = dstData.data;
       for (let i = 0; i < sp.length; i += 4) {
-        dp[i]     = pR ^ (dp[i]     & (pR ^ sp[i]));
-        dp[i + 1] = pG ^ (dp[i + 1] & (pG ^ sp[i + 1]));
-        dp[i + 2] = pB ^ (dp[i + 2] & (pB ^ sp[i + 2]));
+        dp[i]     = pR ^ (sp[i]     & (dp[i]     ^ pR));
+        dp[i + 1] = pG ^ (sp[i + 1] & (dp[i + 1] ^ pG));
+        dp[i + 2] = pB ^ (sp[i + 2] & (dp[i + 2] ^ pB));
       }
       putResult(dstData);
     } else {

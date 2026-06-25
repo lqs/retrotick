@@ -148,9 +148,14 @@ export function registerMessage(emu: Emulator): void {
       }
     }
 
-    // PeekMessage is non-blocking: return 0 (no message).
-    // Yield to the browser to deliver events and render frames.
-    if (emu.wndProcDepth <= 1) {
+    // PeekMessage is non-blocking. Only the TOP-LEVEL spin loop (wndProcDepth 0)
+    // parks-and-yields so the browser can deliver events / render a frame,
+    // resuming with 0. Inside a WndProc/callback (depth > 0) PeekMessage must
+    // return synchronously — Windows does, and the v86 kernel can't park in a
+    // nested callback (it substitutes IDOK=1, which a backlog check like
+    // ssstars' `PeekMessage(WM_TIMER, PM_REMOVE)` misreads as "another timer
+    // pending" and ramps its interval up forever).
+    if (emu.wndProcDepth === 0) {
       const stackBytes = emu._currentThunkStackBytes;
       emu.waitingForMessage = true;
       const waitThread = emu.currentThread;

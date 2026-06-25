@@ -214,6 +214,12 @@ export class KernelRuntime implements KernelMemHost {
      *  launcher (ECX=entry, EDX=stack-with-param). */
     createThread(parent: KProc, entry: number, param: number, stackSize = 0x100000): KProc {
         const as = parent.as;
+        // TEBs descend a page at a time from TEB_VA_BASE (0x7FFDE000). The
+        // callback-return shim page (USER_SHIM_VA = 0x7FFDC000) sits in that descent
+        // — the 3rd thread would otherwise get its TEB mapped over the shim, so a
+        // callback returning to cbReturnVA (=USER_SHIM_VA) would execute the TEB as
+        // code and wild-jump. Skip the shim page (and stay clear of PEB/KUSER above).
+        while (((TEB_VA_BASE - this.nextTebIndex * PAGE_SIZE) >>> 0) === USER_SHIM_VA) this.nextTebIndex++;
         const t: KProc = {
             pid: parent.pid, tid: this.nextTid++, as, emu: parent.emu,
             protect: parent.protect, reserved: parent.reserved,

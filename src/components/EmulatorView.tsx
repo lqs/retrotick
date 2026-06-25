@@ -55,6 +55,12 @@ function buildMKFlags(e: PointerEvent): number {
   return flags;
 }
 
+// Unique ids for UI-originated message boxes (missing-DLL warnings, etc.).
+// Must not collide with guest box ids (positive, from _nextMessageBoxId) nor
+// the fixed synthetic ids (-1 exit, -99 missing-DLL batch). Decrements so two
+// boxes opened in the same millisecond never share a React key.
+let nextSyntheticMessageBoxId = -1000;
+
 function makeLParam(x: number, y: number): number {
   return ((y & 0xFFFF) << 16) | (x & 0xFFFF);
 }
@@ -732,7 +738,7 @@ export function EmulatorView({ arrayBuffer, peInfo, additionalFiles, exeName, co
         if (!initialLoadDone) return; // will be listed in the post-run batch
         const s = t();
         setMessageBoxes(prev => [...prev, {
-          id: Date.now(),
+          id: nextSyntheticMessageBoxId--,
           caption: exeBaseName,
           text: `${s.missingDlls.replace('{0}', dllName)}\n\n${s.missingDllsHint}`,
           type: 0x30, /* MB_ICONWARNING */

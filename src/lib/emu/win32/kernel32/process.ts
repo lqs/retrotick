@@ -130,6 +130,17 @@ export function registerProcess(emu: Emulator): void {
       return 1;
     }
 
+    // v86-managed process (Task Manager terminating another process): route to the
+    // kernel scheduler to zombify it and tear down its UI.
+    const kinfo = emu.handles.get<{ kpid?: number }>(hProcess);
+    if (kinfo && kinfo.kpid !== undefined) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const krt = emu._v86Runtime as any;
+      const ok = krt?.terminateProcess?.(kinfo.kpid, uExitCode);
+      console.log(`[PROCESS] TerminateProcess: v86 pid=0x${kinfo.kpid.toString(16)} ok=${ok}`);
+      return ok ? 1 : 0;
+    }
+
     // Check if it's a handle to a child process or the current process
     const info = emu.handles.get<{ threadId?: number; name?: string }>(hProcess);
     if (!info) {
@@ -407,6 +418,14 @@ export function registerProcess(emu: Emulator): void {
     const _dwDesiredAccess = emu.readArg(0);
     const _bInheritHandle = emu.readArg(1);
     const dwProcessId = emu.readArg(2);
+    // A v86-managed process (Task Manager opening another running process to
+    // terminate it): tag the handle with its kernel pid so TerminateProcess can
+    // route to the scheduler rather than no-op.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const krt = emu._v86Runtime as any;
+    if (krt && krt.procByPid && krt.procByPid(dwProcessId)) {
+      return emu.handles.alloc('process', { kpid: dwProcessId, processId: dwProcessId });
+    }
     return emu.handles.alloc('process', { processId: dwProcessId });
   });
   kernel32.register('SetProcessAffinityMask', 2, () => 1);

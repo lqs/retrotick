@@ -669,6 +669,37 @@ export class KernelRuntime implements KernelMemHost {
         else { this.haltCpu(); void this.emu.stop(); } // park on HALT so the dispatch's iret doesn't run into garbage
     }
 
+    /** Kill another process by pid (Task Manager's End Process → TerminateProcess
+     *  on a v86-managed process). Zombifies every thread of the pid, wakes anything
+     *  waiting on it, and notifies that process's UI to tear down. Hands off the CPU
+     *  only if the victim was the running process (normally it's a different one). */
+    terminateProcess(pid: number, exitCode = 0): boolean {
+        const victims = this.procs.filter(p => p.pid === pid && p.state !== 'zombie');
+        if (victims.length === 0) return false;
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        let notifyEmu: any = null;
+        for (const dead of victims) {
+            dead.state = 'zombie';
+            dead.exitCode = exitCode;
+            for (const w of dead.waiters) { w.pendingRet = 0 /* WAIT_OBJECT_0 */; if (w.state === 'blocked') w.state = 'ready'; }
+            dead.waiters = [];
+            if (dead.emu && !notifyEmu) notifyEmu = dead.emu;
+        }
+        if (notifyEmu && !notifyEmu._kExitNotified) {
+            notifyEmu._kExitNotified = true;
+            notifyEmu.exitCode = exitCode; notifyEmu.exitedNormally = true;
+            try { notifyEmu.onExit?.(); } catch (e) { console.error('[kernel] terminate notify threw:', e); }
+        }
+        // Only reschedule if we just killed the thread the CPU is on.
+        if (this.current && this.current.state === 'zombie') {
+            const next = this.pickNext();
+            if (next) this.runProc(next, false);
+            else if (this.procs.some(p => p.state === 'blocked')) this.goIdle();
+            else { this.haltCpu(); void this.emu.stop(); }
+        }
+        return true;
+    }
+
     private goIdle(): void { this._idle = true; this.haltCpu(); this.startFramePump(); }
 
     // Continuous-repaint frame pump. The own-backend resets _paintSynthBudget and

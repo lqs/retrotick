@@ -48,6 +48,19 @@ import { registerOpengl32 } from '../win32/opengl32';
 import { registerGlu32 } from '../win32/glu32';
 import { registerDdraw } from '../win32/ddraw';
 import { registerUxtheme } from '../win32/uxtheme';
+import { registerMsacm32 } from '../win32/msacm32';
+import { registerWinspool } from '../win32/winspool';
+import { registerDsound } from '../win32/dsound';
+import { registerIphlpapi } from '../win32/iphlpapi';
+import { registerSecur32 } from '../win32/secur32';
+import { registerSetupapi } from '../win32/setupapi';
+import { registerMpr } from '../win32/mpr';
+import { registerImm32 } from '../win32/imm32';
+import { registerMsimg32 } from '../win32/msimg32';
+import { registerVdmdbg } from '../win32/vdmdbg';
+import { registerWinsta } from '../win32/winsta';
+import { registerUtildll } from '../win32/utildll';
+import { registerNetapi32 } from '../win32/netapi32';
 
 export interface KernelBootOptions {
     wasmBytes?: ArrayBuffer | Uint8Array;
@@ -73,7 +86,10 @@ function registerAllDlls(emu: Emulator): void {
     registerShlwapi(emu); registerVersion(emu); registerWinmm(emu); registerPsapi(emu);
     registerOleaut32(emu); registerOle32(emu); registerNtdll(emu); registerWs2_32(emu);
     registerOpengl32(emu); registerGlu32(emu); registerDdraw(emu);
-    registerUxtheme(emu);
+    registerUxtheme(emu); registerMsacm32(emu); registerWinspool(emu); registerDsound(emu);
+    registerIphlpapi(emu); registerSecur32(emu); registerSetupapi(emu); registerMpr(emu);
+    registerImm32(emu); registerMsimg32(emu); registerVdmdbg(emu); registerWinsta(emu);
+    registerUtildll(emu); registerNetapi32(emu);
 }
 
 /** Set up TEB at the real 0x7FFDE000 and PEB at 0x7FFDF000 (mapped lazily on

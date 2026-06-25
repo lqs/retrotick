@@ -480,6 +480,24 @@ export function createProcessOnKernel(
             // Rewrite the imm16 of the `ret N` (stub byte 3..4).
             proc.as.writeBytes((thunkVA + 3) >>> 0, new Uint8Array([stackBytes & 0xFF, (stackBytes >>> 8) & 0xFF]));
         };
+
+        // BUILTIN_WNDPROC: when an app subclasses/superclasses a built-in control
+        // (SysListView32, EDIT, …) it saves the original class wndProc (returned by
+        // GetClassInfo / GetWindowLong) and chains unhandled messages to it via
+        // CallWindowProc or a direct `call [savedProc]`. The own-backend uses fixed
+        // sentinels (0x00FE0008/0x00FE000C) trapped in cpu.step; the kernel has no
+        // interpreter hook, so calling a bare sentinel VA runs demand-zero memory and
+        // wild-jumps. Mint real `int 0x2E` thunks routing to the built-in message
+        // handler and repoint the sentinels — GetClassInfo et al. read these fields
+        // dynamically, so every consumer gets a genuinely callable address.
+        if (emu._handleBuiltinMessage) {
+            const mkBwp = (wide: boolean) => emu._kernelMakeComThunk!(`BUILTIN_WNDPROC_${wide ? 'W' : 'A'}`, 16, () => {
+                const hwnd = emu.readArg(0), message = emu.readArg(1), wParam = emu.readArg(2), lParam = emu.readArg(3);
+                return emu._handleBuiltinMessage!(hwnd, message, wParam, lParam, wide) ?? 0;
+            });
+            emu._builtinWndProcA = mkBwp(false);
+            emu._builtinWndProcW = mkBwp(true);
+        }
     }
 
     const resourceDir = peInfo.optionalHeader.dataDirectories?.[2];

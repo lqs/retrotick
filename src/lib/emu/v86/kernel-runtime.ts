@@ -105,6 +105,7 @@ export class KernelRuntime implements KernelMemHost {
     private _handlerActive = false;  // true only while synchronously inside h.handler()
     private _handlerUserESP = 0;     // the live user ESP at the current handler's entry
     private _cbBusy = false;         // true while synchronously running a callback's _mainLoop
+    private _tssEsp0 = 0;            // mirror of TSS.ESP0 — current ring0 trap stack top
 
     constructor(private opts: KernelRuntimeOptions = {}) {}
 
@@ -399,7 +400,8 @@ export class KernelRuntime implements KernelMemHost {
         this.memory.invalidate();
         patchFsBase(this.emu, proc.tebVA);
         if (this.cpu.segment_offsets) this.cpu.segment_offsets[4] = proc.tebVA | 0;
-        patchTssEsp0(this.emu, proc.ring0StackTop || INIT_ESP);
+        this._tssEsp0 = (proc.ring0StackTop || INIT_ESP) >>> 0;
+        patchTssEsp0(this.emu, this._tssEsp0);
     }
 
     private writeRetEaxAt(r0esp: number, val: number): void {
@@ -810,22 +812,26 @@ export class KernelRuntime implements KernelMemHost {
             ? (this._handlerUserESP >>> 0)                           // recorded user ESP of the live handler
             : (this.currentAS.readU32(proc.parkedR0esp + 44) >>> 0); // saved ESP in the parked iret frame
 
-        // Run each callback nesting level on its OWN ring0 sub-stack slice, keyed
-        // off the callback depth. Deeply nested callbacks (wndproc → C++ throw →
-        // __CxxFrameHandler → catch funclet) each get a distinct slice, so their
-        // launcher iret-frames and nested int 0x2E traps never clobber an outer
-        // level — that collision (all levels reusing ring0StackTop) corrupted the
-        // continuation EIP and wild-jumped. TSS.ESP0 is pointed at this slice so
-        // ring3→ring0 traps DURING this callback also land here.
+        // Run this callback on a ring0 sub-stack slice that starts BELOW the
+        // currently-live ring0 frame (the active API handler's pushal frame, or the
+        // parked thread's iret frame), so the callback's launcher iret-frame AND any
+        // nested int 0x2E traps DURING the callback stack downward, never overlapping
+        // the outer frame. Anchoring at ring0StackTop instead would collide: the live
+        // top-level handler frame sits at ring0StackTop-0x34 (it trapped from ring3
+        // with TSS.ESP0=ring0StackTop), so a depth-0 callback anchored at ring0StackTop
+        // lands a nested value-returning API (e.g. CreateDialogParam inside
+        // WM_INITDIALOG) on the SAME bytes as the outer frame, corrupting its return
+        // value / continuation. frameBase tracks the descent across nesting levels,
+        // so one RING0_SLICE below it is always disjoint from every outer frame.
         const RING0_SLICE = 0x400;
-        const esp0 = (proc.ring0StackTop - this._cbDepth * RING0_SLICE) >>> 0;
+        const frameBase = (activeHandler ? this._apiR0esp : proc.parkedR0esp) >>> 0;
+        const esp0 = (frameBase - RING0_SLICE) >>> 0;
+        const prevEsp0 = this._tssEsp0;   // outer level's trap stack — restored on return
+        this._tssEsp0 = esp0;
         patchTssEsp0(this.emu, esp0);
 
-        // At depth 0 the launcher frame overlaps the live/parked frame's top, so
-        // preserve+restore those bytes; deeper slices are disjoint (savedFrame null).
-        const frameBase = (activeHandler ? this._apiR0esp : proc.parkedR0esp) >>> 0;
-        const savedFrame = (frameBase && esp0 > frameBase)
-            ? this.currentAS.readBytes(frameBase, (esp0 - frameBase) >>> 0) : null;
+        // esp0 is strictly below frameBase, so the callback never overlaps the outer
+        // frame and there is nothing to preserve/restore at the boundary.
         const s = {
             eip: cpu.instruction_pointer[0], esp: cpu.reg32[4],
             ebx: cpu.reg32[3], ebp: cpu.reg32[5], esi: cpu.reg32[6], edi: cpu.reg32[7],
@@ -887,15 +893,17 @@ export class KernelRuntime implements KernelMemHost {
         }
         const ret = this._cbReturnEax | 0;
 
-        // Restore TSS.ESP0 to the process's full ring0 stack top for the next
-        // top-level trap (an outer callback resets it again on entry).
-        patchTssEsp0(this.emu, proc.ring0StackTop || INIT_ESP);
+        // Restore TSS.ESP0 to the OUTER level's trap stack. If this was the outermost
+        // callback, prevEsp0 == ring0StackTop (top-level trap stack); if nested, it's
+        // the enclosing callback's slice, so the outer callback's continued execution
+        // keeps trapping onto its own region (not back at the global top → collision).
+        this._tssEsp0 = prevEsp0;
+        patchTssEsp0(this.emu, prevEsp0 || proc.ring0StackTop || INIT_ESP);
 
         // If the callback terminated the process, don't touch its (dead) state.
         if (proc.state === 'zombie') { return ret; }
 
-        // Restore the depth-0 boundary frame + live CPU registers.
-        if (savedFrame) this.currentAS.writeBytes(frameBase, savedFrame);
+        // Restore the live CPU registers captured at callback entry.
         cpu.instruction_pointer[0] = s.eip; cpu.reg32[4] = s.esp;
         cpu.reg32[3] = s.ebx; cpu.reg32[5] = s.ebp; cpu.reg32[6] = s.esi; cpu.reg32[7] = s.edi;
         cpu.reg32[1] = s.ecx; cpu.reg32[2] = s.edx;

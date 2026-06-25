@@ -67,6 +67,13 @@ export function kernelStackTop(index: number): number {
 export class AddressSpace {
     pdPhys: number;
 
+    /** Set by the runtime: invoked after any PTE mutation so a live (current) AS
+     *  can flush the WASM CPU's TLB — otherwise the CPU may serve a stale cached
+     *  translation for a page whose mapping just changed (e.g. a thread's TEB/stack
+     *  added to a running process), reading the wrong physical frame. */
+    onMutate?: () => void;
+    private _suppressMutate = false;
+
     constructor(
         private emu: V86Instance,
         private frames: FrameAllocator,
@@ -106,14 +113,19 @@ export class AddressSpace {
         }
         const pteIdx = (va >>> 12) & 0x3FF;
         wr32(this.emu, pt + pteIdx * 4, (physFrame & PTE_FRAME_MASK) | flags);
+        if (!this._suppressMutate) this.onMutate?.();
     }
 
     /** Allocate `nPages` fresh frames and map them contiguously at `va`. */
     mapRange(va: number, nPages: number, flags: number): void {
-        for (let i = 0; i < nPages; i++) {
-            const frame = this.frames.alloc();
-            this.mapPage(va + i * PAGE_SIZE, frame, flags);
-        }
+        this._suppressMutate = true;
+        try {
+            for (let i = 0; i < nPages; i++) {
+                const frame = this.frames.alloc();
+                this.mapPage(va + i * PAGE_SIZE, frame, flags);
+            }
+        } finally { this._suppressMutate = false; }
+        this.onMutate?.();
     }
 
     getPTE(va: number): number {
@@ -131,6 +143,7 @@ export class AddressSpace {
             wr32(this.emu, this.pdPhys + pdeIdx * 4, pde);
         }
         wr32(this.emu, (pde & PTE_FRAME_MASK) + ((va >>> 12) & 0x3FF) * 4, val);
+        if (!this._suppressMutate) this.onMutate?.();
     }
 
     /** Ensure `va`'s page is backed by a frame; returns the page's physical

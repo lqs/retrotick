@@ -153,6 +153,10 @@ export class KernelRuntime implements KernelMemHost {
     // -- Process management ---------------------------------------------------
     createProcess(): KProc {
         const as = new AddressSpace(this.emu, this.frames, this.shared);
+        // If this AS is the one the CPU is currently running on, a PTE change must
+        // flush the WASM TLB (e.g. CreateThread / VirtualAlloc adding pages to a live
+        // process — the CPU would otherwise read a stale frame for the changed page).
+        as.onMutate = () => { if (this.current?.as === as) { this.cpu.full_clear_tlb(); this.memory.invalidate(); } };
         // Map the per-process ring3 callback-return shim page.
         as.mapRange(USER_SHIM_VA, 1, PTE_PRESENT | PTE_RW | PTE_USER);
         as.writeBytes(USER_SHIM_VA, USER_SHIM_BYTES);

@@ -275,10 +275,13 @@ export function createProcessOnKernel(
             // WaitForSingleObject) wants to wait for an async event. We can
             // only truly park at the TOP-LEVEL message loop. Inside a nested
             // synchronous callback (wndProcDepth>0, e.g. a wndproc that pops
-            // a modal MessageBox), there's no JS call stack to suspend, so we
-            // cannot block — clear the wait and return IDOK so the callback
-            // continues instead of spinning the CPU on HALT to exhaustion.
-            if (emu.wndProcDepth > 0) {
+            // a modal MessageBox). We CAN still block here if another thread can
+            // run — the cooperative scheduler switches to it and resumes us when
+            // woken (taskmgr's UI thread WaitForSingleObject's on a worker thread
+            // created in WM_INITDIALOG). Only when NO sibling can run is there no
+            // way to make progress, so we clear the wait and return IDOK (a modal
+            // dialog default) rather than spin the CPU on HALT to exhaustion.
+            if (emu.wndProcDepth > 0 && !rt.canBlock()) {
                 emu.waitingForMessage = false;
                 emu._onMessageAvailable = null;
                 return IDOK; // sensible default for modal dialogs (MB_OK etc.)

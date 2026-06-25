@@ -50,6 +50,11 @@ export function registerSync(emu: Emulator): void {
     signaled: boolean;
     manualReset?: boolean;
     waiters?: Array<() => void>;
+    // Kernel backend: threads (KProc) blocked on this event, woken via the
+    // scheduler. The legacy `waiters` (own-backend) callbacks don't drive the
+    // v86 kernel's cooperative CPU, so kernel waits must go through wakeProc.
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    kwaiters?: any[];
   }
   const createEvent = () => {
     const manualReset = !!emu.readArg(1);
@@ -69,6 +74,16 @@ export function registerSync(emu: Emulator): void {
     const ev = emu.handles.get<EventInfo>(h);
     if (ev) {
       ev.signaled = true;
+      // Kernel backend: wake threads blocked via the scheduler. The signaling
+      // thread keeps running; the readied waiter runs at the next yield. Manual-
+      // reset wakes all (event stays signaled); auto-reset wakes one + consumes.
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const krt = emu._v86Runtime as any;
+      if (krt && ev.kwaiters && ev.kwaiters.length > 0) {
+        const toWake = ev.manualReset ? ev.kwaiters.splice(0) : ev.kwaiters.splice(0, 1);
+        if (!ev.manualReset) ev.signaled = false; // auto-reset consumed by the woken waiter
+        for (const p of toWake) krt.wakeProc(p, WAIT_OBJECT_0);
+      }
       // Wake waiters asynchronously — we are executing inside a thunk handler
       // on the signaling thread; the waiter's resume must not run (and switch
       // threads) until this handler has completed.
@@ -122,6 +137,23 @@ export function registerSync(emu: Emulator): void {
         return WAIT_OBJECT_0;
       }
       if (timeout === 0) return WAIT_TIMEOUT;
+
+      // Kernel backend: block this thread via the scheduler so OTHER threads
+      // (e.g. the worker that will SetEvent us) actually run. The legacy
+      // captureThreadResume/emu.tick path below never drives the v86 kernel CPU,
+      // so under the kernel it would spin-redirect and hang (taskmgr's
+      // CreateThread+SetEvent+WaitForSingleObject(INFINITE) worker pattern).
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const krt = emu._v86Runtime as any;
+      if (krt && krt.current && timeout === INFINITE && krt.canBlock && krt.canBlock()) {
+        const p = krt.blockOnWait();
+        if (p) {
+          if (!obj.kwaiters) obj.kwaiters = [];
+          obj.kwaiters.push(p);
+          emu.waitingForMessage = true;
+          return undefined;
+        }
+      }
 
       const stackBytes = emu._currentThunkStackBytes;
       emu.waitingForMessage = true;

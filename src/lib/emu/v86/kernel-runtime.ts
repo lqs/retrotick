@@ -48,6 +48,11 @@ export interface KProc {
     snap: KCpuSnapshot | null;   // saved CPU state while not running
     parkedR0esp: number;         // ring0 ESP where the blocked API's frame sits
     pendingRet: number | undefined; // API return value to deliver on resume
+    // Nested-callback context captured when this thread blocked mid-callback, so a
+    // resuming thread restores its OWN ring0 trap stack / live-handler frame rather
+    // than inheriting whatever the thread that ran in the meantime left in the
+    // (globally-shared) callback state. Null for a never-blocked or fresh thread.
+    cbState: { apiR0esp: number; tssEsp0: number; handlerActive: boolean; handlerUserESP: number; wndProcDepth: number } | null;
     protect: Map<number, number>;   // pageVA → Win32 PAGE_* (VirtualProtect overrides)
     reserved: Map<number, number>;  // pageVA → size-marker for MEM_RESERVE-only ranges (AV until committed)
     parentPid: number;
@@ -165,7 +170,7 @@ export class KernelRuntime implements KernelMemHost {
             entryVA: 0, userStackTop: 0, tebVA: 0,
             ring0StackTop: kernelStackTop(this.procs.length),
             cbReturnVA: USER_SHIM_VA,
-            state: 'new', snap: null, parkedR0esp: 0, pendingRet: undefined,
+            state: 'new', snap: null, parkedR0esp: 0, pendingRet: undefined, cbState: null,
             protect: new Map(), reserved: new Map(),
             parentPid: 0, exitCode: 0, waiters: [], thunkSites: new Map(),
         };
@@ -217,7 +222,7 @@ export class KernelRuntime implements KernelMemHost {
             ring0StackTop: kernelStackTop(this.procs.length),
             tebVA: (TEB_VA_BASE - this.nextTebIndex * PAGE_SIZE) >>> 0,
             entryVA: entry, userStackTop: 0,
-            state: 'new', snap: null, parkedR0esp: 0, pendingRet: undefined,
+            state: 'new', snap: null, parkedR0esp: 0, pendingRet: undefined, cbState: null,
         };
         this.nextTebIndex++;
         // Ring3 stack (top page mapped now; rest demand-paged). Initial frame:
@@ -562,6 +567,29 @@ export class KernelRuntime implements KernelMemHost {
     requestPark(): void { this._pendingPark = true; }
     isParked(): boolean { return this._idle; }
 
+    /** True if blocking the current thread would let ANOTHER thread make progress
+     *  (a ready/new sibling exists). When true, a blocking API inside a nested
+     *  callback (wndProcDepth>0) can genuinely park instead of returning a stub —
+     *  the cooperative scheduler runs the sibling (e.g. taskmgr's worker thread
+     *  that the UI thread WaitForSingleObject's on) and resumes us when woken. */
+    canBlock(): boolean { return this.pickNext() !== null; }
+
+    /** Block the current thread on a kernel-scheduled wait (e.g. an auto/manual
+     *  reset Event). Records nothing object-side; the API handler keeps the waiter
+     *  list and calls wakeProc() when it signals. Returns the KProc that is being
+     *  parked so the caller can register it. */
+    blockOnWait(): KProc | null { const p = this.current; if (p) this.requestPark(); return p ?? null; }
+
+    /** Wake a thread blocked on a kernel wait, delivering `retVal` as the blocking
+     *  API's return value. If the CPU is idle (every thread was blocked), kick the
+     *  scheduler so the readied thread runs; otherwise the currently-running thread
+     *  picks it up at its next yield. */
+    wakeProc(proc: KProc, retVal: number): void {
+        proc.pendingRet = retVal;
+        if (proc.state === 'blocked') proc.state = 'ready';
+        if (this._idle) { const next = this.pickNext(); if (next) this.runProc(next, false); }
+    }
+
     // -- Cooperative scheduler (one logical CPU; switch at blocking points) ----
 
     private captureSnap(): KCpuSnapshot {
@@ -600,6 +628,10 @@ export class KernelRuntime implements KernelMemHost {
         proc.state = 'blocked';
         proc.parkedR0esp = this.cpu.reg32[4] >>> 0;
         proc.snap = this.captureSnap();
+        // Save this thread's nested-callback context. The globally-shared callback
+        // state is about to be reused by whichever thread runs next; on resume this
+        // thread restores its own ring0 trap stack + live-handler frame.
+        proc.cbState = { apiR0esp: this._apiR0esp, tssEsp0: this._tssEsp0, handlerActive: this._handlerActive, handlerUserESP: this._handlerUserESP, wndProcDepth: (proc.emu?.wndProcDepth as number) ?? 0 };
         const next = this.pickNext();
         if (next) this.runProc(next, false); else this.goIdle();
     }
@@ -691,6 +723,11 @@ export class KernelRuntime implements KernelMemHost {
             this.cpu.reg32[1] = proc.entryVA | 0;        // ECX = entry
             this.cpu.reg32[2] = proc.userStackTop | 0;   // EDX = user ESP
             this.cpu.instruction_pointer[0] = LAUNCHER_VA | 0;
+            // Fresh thread: no live handler, ring0 trap stack at its own top
+            // (switchTo already set _tssEsp0). Clear inherited callback context so
+            // its first int 0x2E / callback doesn't reuse another thread's frame.
+            this._apiR0esp = 0; this._handlerActive = false; this._handlerUserESP = 0;
+            if (proc.emu) proc.emu.wndProcDepth = 0; // fresh thread isn't inside any callback
         } else {
             this.restoreSnap(proc.snap!);
             if (proc.pendingRet !== undefined) {
@@ -698,6 +735,16 @@ export class KernelRuntime implements KernelMemHost {
                 proc.pendingRet = undefined;
             }
             if (proc.emu) proc.emu.waitingForMessage = false; // the blocking API is completing
+            // Restore the thread's own nested-callback context (ring0 trap stack +
+            // live-handler frame) saved when it blocked, so its subsequent traps
+            // land on its own ring0 frames, not the global top switchTo just set.
+            if (proc.cbState) {
+                this._apiR0esp = proc.cbState.apiR0esp; this._tssEsp0 = proc.cbState.tssEsp0;
+                this._handlerActive = proc.cbState.handlerActive; this._handlerUserESP = proc.cbState.handlerUserESP;
+                if (proc.emu) proc.emu.wndProcDepth = proc.cbState.wndProcDepth;
+                patchTssEsp0(this.emu, this._tssEsp0);
+                proc.cbState = null;
+            }
         }
         proc.state = 'running';
         this._inHlt[0] = 0;

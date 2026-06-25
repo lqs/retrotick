@@ -18,6 +18,14 @@ export function registerDialog(emu: Emulator): void {
     for (const [addr, info] of emu.thunkToApi) {
       if (info.dll === 'USER32.DLL' && (info.name === 'DefDlgProcA' || info.name === 'DefDlgProcW')) return addr;
     }
+    // Ring3 kernel: the legacy dynamicThunkPtr/thunkToApi path below is only
+    // intercepted by the own-backend's cpu.step. Under the kernel a dialog's
+    // wndProc must be a real callable `int 0x2E` thunk, or it stays 0 — and
+    // then WM_INITDIALOG is never delivered and the dialog can't process any
+    // message (a modeless dialog app like taskmgr renders blank).
+    if (emu._kernelGetProcThunk) {
+      return emu._kernelGetProcThunk('USER32.DLL', 'DefDlgProcW') || 0;
+    }
     // If the EXE doesn't import DefDlgProc, allocate a dynamic thunk for it
     if (emu.dynamicThunkPtr) {
       const addr = emu.dynamicThunkPtr;
